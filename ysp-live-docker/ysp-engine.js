@@ -3,7 +3,7 @@ const https = require('https');
 const crypto = require('crypto');
 const url = require('url');
 
-const VERSION = '9.4.0';
+const VERSION = '9.5.0';
 const PORT = parseInt(process.env.YSP_ENGINE_PORT || process.env.PORT || process.argv[2] || '8787', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 
@@ -456,6 +456,21 @@ const server = http.createServer(async (req, res) => {
     if (!targetUrl) {
       res.writeHead(400, { 'Content-Type': 'text/plain' });
       res.end('missing url\n');
+      return;
+    }
+    let targetParsed;
+    try {
+      targetParsed = new url.URL(targetUrl);
+    } catch (e) {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('invalid url\n');
+      return;
+    }
+    const allowedSuffixes = ['.cctv.cn', '.cctv.com', '.cctvpic.com', '.citvc.com', '.yangshipin.cn', '.cntv.cn', '.cntv.com', '.myqcloud.com', '.qqlive.com', '.gtimg.cn', '.smtcdns.net', '.smtcdns.com', '.tcdnlive.com', '.alicdn.com', '.alikunlun.com', '.wscdns.com', '.chinanetcenter.com', '.bdydns.com', '.ksyungslb.com', '.ks-cdn.com'];
+    const thost = (targetParsed.hostname || '').toLowerCase();
+    if ((targetParsed.protocol !== 'http:' && targetParsed.protocol !== 'https:') || !allowedSuffixes.some(s => thost === s.slice(1) || thost.endsWith(s))) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('forbidden segment url\n');
       return;
     }
     try {

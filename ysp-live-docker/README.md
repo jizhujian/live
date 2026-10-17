@@ -1,4 +1,4 @@
-# 📺 央视频全频道直播 v9.4 旗舰版
+# 📺 央视频全频道直播 v9.5 旗舰版
 
 ## 📢 首发地址
 社区：[Gary's Club](https://t.me/garysclub)  
@@ -18,43 +18,39 @@
 ---
 
 ## 🛠 核心更新与修复
-1. **（优化）取消启动强制预热**：全频道纯按需解析，彻底杜绝开机并发拉取 3 路 4K 触发平台频控、CDN 403 限流与设备被封
-2. **（新增）400 自动换身份自愈**：遇到设备风控（HTTP 400）自动废弃旧设备身份、重新生成新设备并重试，内置熔断保护（5分钟仅换一次、每日最多5次）
-3. **（新增）换台防抖**：4K 频道直接秒出 4K 超高清；普通频道切台先秒出 1080p，停留超 10 秒自动无缝升级高码率，播放器无需重开
-4. **（优化）单设备并发池**：26 路高码率频道共用 1 台设备，并发上限 6 路，空闲超 15 秒自动释放配额
-5. **（优化）设备注册失败快速降级 1080p**，不再长时间阻塞；剧场频道备用通道提速
-6. **（新增）网络分流与小火箭一键直连模块**：解决开启翻墙工具时因切片走代理导致的 403 播放失败
+1. **（修复）状态持久化与 400 自愈落盘修复**：补齐内部队列状态初始化，修复 `proxy-cache-state-rs.json` 元数据无法落盘及 400 自动换设备身份时触发异常导致自愈中断的问题
+2. **（优化）换台防抖精准化与防风控减负**：修复 `--zap-debounce` 参数传递；按频道独立追踪防抖状态，稳定观看的高码率频道在 60 秒续期时不再误触发降级；切走或关闭播放器后自动取消后台高码率预取，避免无效请求消耗设备配额与触发风控
+3. **（优化）1080p 通道冷启动与时间线防倒退**：消除冷启动瞬间重复拉取同一频道的冗余请求；修复并发首播等待逻辑避免瞬时 503；新增切片历史去重队列，彻底解决无时间戳流因滑动窗口推进导致的画面倒退回放问题
+4. **（修复）HLS 协议规范与重定向兼容**：跨源切换时的 `#EXT-X-DISCONTINUITY` 严格按 RFC 8216 规范注入于首个媒体切片标签前；内置播放列表拉取新增 HTTPS 与 301/302/307/308 重定向支持，`/proxy.ts` 补齐 `Location` 头透传与 `Range` 分片请求兼容
+5. **（优化）内存缓存 LRU 淘汰与并发性能**：修复 `TsSegmentCache` 重复键入队导致的提前误淘汰问题；预计算复用 AES-256-GCM 轮密钥，降低控制面 CPU 开销；修复 WASM `W.list` 数组写入截断问题
+6. **（增强）反代协议识别、回看时移与安全加固**：支持反向代理 `X-Forwarded-Proto` 自动识别 HTTPS 协议；增强 `catchup` 回看时间解析（支持毫秒级时间戳与 ISO 8601 UTC 格式）；修复 `/engine_proxy` 本地文件读取与 SSRF 风险，优化 `/diag` 实时配额诊断展示
 
 ---
 
 ## 💻 电脑版使用方法（PC / Mac / Linux）
-1. 下载地址：https://garysclub.sharewithyou.dpdns.org/ysp-live/ysp-live-v9.4.zip
+1. 下载地址：https://garysclub.sharewithyou.dpdns.org/ysp-live/ysp-live-v9.5.zip
 2. Node.js 安装（非强制，建议安装，开启四层兜底）：官网下载 https://nodejs.org/zh-cn
 3. 解压进入目录直接运行：
    ```bash
-   python3 ysp-live-v9.4.py
+   python3 ysp-live-v9.5.py
    ```
    （可选）后台常驻运行：
    ```bash
-   nohup python3 ysp-live-v9.4.py > ysp.log 2>&1 &
+   nohup python3 ysp-live-v9.5.py > ysp.log 2>&1 &
    ```
 4. 播放器添加订阅地址：`http://localhost:8767/all.m3u`
 
 ---
 
 ## 🐳 Docker 版使用与升级方法
-1. 下载地址：https://garysclub.sharewithyou.dpdns.org/ysp-live/ysp-live-docker-v9.4.zip
-2. 解压后进入目录，一行命令直接全新构建并启动：
+1. 下载地址：https://garysclub.sharewithyou.dpdns.org/ysp-live/ysp-live-docker-v9.5.zip
+2. 解压后进入目录，一行命令直接全新构建并启动（已内置国内镜像加速与权限自愈）：
    ```bash
-   docker compose build --no-cache
-   docker compose up -d
+   docker compose up -d --build
    ```
 3. 播放器添加订阅地址：
    - 电脑本机播放：`http://localhost:8767/all.m3u`
    - 局域网播放：`http://你的局域网IP:8767/all.m3u`
-
-> 💡 **小贴士**：  
-> NAS 权限说明——群晖 / 威联通 / 软路由等 NAS 用户，如日志提示持久化目录写入受限，请在解压目录下执行 `chmod -R 777 ./data` 赋予持久化权限。
 
 ---
 
@@ -62,7 +58,7 @@
 1. 点击 “配置” ➔ “服务” ➔ “添加服务”
 2. 服务名称：`央视频直播`
 3. 服务类型：`Python`
-4. 代码来源选择 “远程链接”，地址填写：`https://garysclub.sharewithyou.dpdns.org/ysp-live/ysp-live-v9.4.py`
+4. 代码来源选择 “远程链接”，地址填写：`https://garysclub.sharewithyou.dpdns.org/ysp-live/ysp-live-v9.5.py`
 5. 点击 “加载代码” ➔ 划到底部点击 “添加服务” ➔ 打开服务开关
 6. 前往 APTV “添加订阅”，地址填写：`http://127.0.0.1:8767/all.m3u`
 

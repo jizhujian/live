@@ -33,7 +33,7 @@ import urllib .request
 import uuid 
 from collections import deque 
 urllib .request .install_opener (urllib .request .build_opener (urllib .request .ProxyHandler ({}))) 
-__version__ ='9.4.0'
+__version__ ='9.5.0'
 AUTHOR_COMMUNITY ='https://t.me/garysclub'
 AUTHOR_CHANNEL ='https://t.me/garysclubchannel'
 AUTHOR_NOTICE =f'''📢 首发地址
@@ -99,8 +99,7 @@ def _mix_columns (s ):
         s [4 *c +1 ]=a0 ^_xtime (a1 )^(_xtime (a2 )^a2 )^a3 
         s [4 *c +2 ]=a0 ^a1 ^_xtime (a2 )^(_xtime (a3 )^a3 )
         s [4 *c +3 ]=_xtime (a0 )^a0 ^a1 ^a2 ^_xtime (a3 )
-def aes256_encrypt_block (key :bytes ,block :bytes )->bytes :
-    rk =_aes256_key_schedule (key )
+def _aes256_encrypt_block_rk (rk :list ,block :bytes )->bytes :
     s =bytearray (block )
     _add_round_key (s ,rk [0 ])
     for rnd in range (1 ,14 ):
@@ -112,6 +111,8 @@ def aes256_encrypt_block (key :bytes ,block :bytes )->bytes :
     _shift_rows (s )
     _add_round_key (s ,rk [14 ])
     return bytes (s )
+def aes256_encrypt_block (key :bytes ,block :bytes )->bytes :
+    return _aes256_encrypt_block_rk (_aes256_key_schedule (key ),block )
 def _gf_mult (x :int ,y :int )->int :
     r =299076299051606071403356588563077529600 
     z =0 
@@ -143,34 +144,38 @@ def _ghash (h :int ,aad :bytes ,ct :bytes )->int :
 def _inc32 (block :bytes )->bytes :
     ctr =int .from_bytes (block [12 :],'big')
     return block [:12 ]+(ctr +1 &4294967295 ).to_bytes (4 ,'big')
-def _gctr (key :bytes ,icb :bytes ,data :bytes )->bytes :
+def _gctr_rk (rk :list ,icb :bytes ,data :bytes )->bytes :
     out =bytearray ()
     cb =icb 
     for i in range (0 ,len (data ),16 ):
-        ks =aes256_encrypt_block (key ,cb )
+        ks =_aes256_encrypt_block_rk (rk ,cb )
         chunk =data [i :i +16 ]
         out +=bytes ((a ^b for a ,b in zip (chunk ,ks )))
         cb =_inc32 (cb )
     return bytes (out )
+def _gctr (key :bytes ,icb :bytes ,data :bytes )->bytes :
+    return _gctr_rk (_aes256_key_schedule (key ),icb ,data )
 def aes_gcm_encrypt (key :bytes ,nonce :bytes ,plaintext :bytes ,aad :bytes =b'')->bytes :
     assert len (key )==32 and len (nonce )==12 
-    h =int .from_bytes (aes256_encrypt_block (key ,b'\x00'*16 ),'big')
+    rk =_aes256_key_schedule (key )
+    h =int .from_bytes (_aes256_encrypt_block_rk (rk ,b'\x00'*16 ),'big')
     j0 =nonce +b'\x00\x00\x00\x01'
-    ct =_gctr (key ,_inc32 (j0 ),plaintext )
+    ct =_gctr_rk (rk ,_inc32 (j0 ),plaintext )
     s =_ghash (h ,aad ,ct ).to_bytes (16 ,'big')
-    tag =bytes ((a ^b for a ,b in zip (aes256_encrypt_block (key ,j0 ),s )))
+    tag =bytes ((a ^b for a ,b in zip (_aes256_encrypt_block_rk (rk ,j0 ),s )))
     return ct +tag 
 def aes_gcm_decrypt (key :bytes ,nonce :bytes ,ct_and_tag :bytes ,aad :bytes =b'')->bytes :
     if len (ct_and_tag )<16 :
         raise ValueError ('AES-GCM payload too short')
     ct ,tag =(ct_and_tag [:-16 ],ct_and_tag [-16 :])
-    h =int .from_bytes (aes256_encrypt_block (key ,b'\x00'*16 ),'big')
+    rk =_aes256_key_schedule (key )
+    h =int .from_bytes (_aes256_encrypt_block_rk (rk ,b'\x00'*16 ),'big')
     j0 =nonce +b'\x00\x00\x00\x01'
     s =_ghash (h ,aad ,ct ).to_bytes (16 ,'big')
-    expect =bytes ((a ^b for a ,b in zip (aes256_encrypt_block (key ,j0 ),s )))
+    expect =bytes ((a ^b for a ,b in zip (_aes256_encrypt_block_rk (rk ,j0 ),s )))
     if not _hmac .compare_digest (tag ,expect ):
         raise ValueError ('AES-GCM decrypt failed')
-    return _gctr (key ,_inc32 (j0 ),ct )
+    return _gctr_rk (rk ,_inc32 (j0 ),ct )
 def _mgf1_sha256 (seed :bytes ,length :int )->bytes :
     out =bytearray ()
     counter =0 
@@ -828,6 +833,9 @@ class ResolverState :
         self .zap_time =0.0 
         self .zap_pending =''
         self .zap_generation =0 
+        self .zap_times :dict [str ,float ]={}
+        self .zap_pending_channels :set [str ]=set ()
+        self .zap_generations :dict [str ,int ]={}
         self .last_device_wipe_at =0.0 
         self .device_wipe_day =''
         self .device_wipe_count =0 
@@ -894,6 +902,7 @@ class Resolver :
         self .playlist_locks_lock =threading .Lock ()
         self .playlist_locks :dict [str ,threading .Lock ]={}
         self .refresh_queue =RefreshQueue ()
+        self .http_queue =HttpQueue ()
         self .state .cache =load_cache (args .meta_json )
     def start_heartbeat (self ):
         def loop ():
@@ -1008,24 +1017,40 @@ class Resolver :
             entry =self .state .cache .get (channel )
             if entry is not None and entry .fresh (now )and not entry_missing_signed_playback_headers (entry ):
                 return False 
-            if self .state .zap_channel !=channel :
-                self .state .zap_channel =channel 
-                self .state .zap_time =now 
-                self .state .zap_pending =''
-            if self .state .zap_pending ==channel :
+            sess =self .state .sessions .get (0 )
+            if sess is not None and channel in sess .linked_channels and entry is not None and (now -entry .expires_at <30.0 ):
+                return False 
+            self .state .zap_channel =channel 
+            if channel in self .state .zap_pending_channels :
                 return True 
-            if now -self .state .zap_time <debounce :
+            ch_zap_time =self .state .zap_times .get (channel ,0.0 )
+            if ch_zap_time <=0.0 or (now -ch_zap_time >max (debounce *3.0 ,30.0 )):
+                ch_zap_time =now 
+                self .state .zap_times [channel ]=now 
+                self .state .zap_time =now 
+            if now -ch_zap_time <debounce :
                 self .state .zap_pending =channel 
+                self .state .zap_pending_channels .add (channel )
                 self .state .zap_generation +=1 
-                gen =self .state .zap_generation 
-                delay =max (0.1 ,debounce -(now -self .state .zap_time ))
+                gen =self .state .zap_generations .get (channel ,0 )+1 
+                self .state .zap_generations [channel ]=gen 
+                delay =max (0.1 ,debounce -(now -ch_zap_time ))
                 threading .Thread (target =self ._zap_resolve_worker ,args =(channel ,gen ,delay ),daemon =True ).start ()
                 return True 
             return False 
     def _zap_resolve_worker (self ,channel :str ,gen :int ,delay :float ):
         time .sleep (delay )
+        now =now_f64 ()
         with self .state_lock :
-            if gen !=self .state .zap_generation or self .state .zap_channel !=channel :
+            if gen !=self .state .zap_generations .get (channel ,0 ):
+                self .state .zap_pending_channels .discard (channel )
+                return 
+            last_acc =self .state .channel_last_access .get (channel ,0.0 )
+            if (now -last_acc >max (delay +2.0 ,12.0 ))or (self .state .zap_channel !=channel and now -last_acc >5.0 ):
+                self .state .zap_pending_channels .discard (channel )
+                self .state .zap_times .pop (channel ,None )
+                if self .state .zap_pending ==channel :
+                    self .state .zap_pending =''
                 return 
         try :
             self .ensure_channel (channel ,force =True )
@@ -1034,6 +1059,7 @@ class Resolver :
             log (f'[{channel }] 高码率后台预取失败: {e }, 继续 1080p',min_interval =10.0 )
         finally :
             with self .state_lock :
+                self .state .zap_pending_channels .discard (channel )
                 if self .state .zap_pending ==channel :
                     self .state .zap_pending =''
     def rotate_device_on_400 (self ,reason :str )->bool :
@@ -1189,7 +1215,7 @@ class Resolver :
                         self .clear_recoverable_error_count ()
                         try :
                             self .write_meta ()
-                        except OSError :
+                        except Exception :
                             pass 
                         return entry 
                 with self .state_lock :
@@ -1612,8 +1638,11 @@ class Resolver :
                         s_curr =self .state .sessions .get (slot )
                     if s_curr is None :
                         continue 
-                    if not self .app_session_fresh (s_curr )or (self .app_session_ttl_remaining (s_curr )or 0.0 )<=300.0 :
+                    self .evict_idle_links (s_curr ,LINK_IDLE_TIMEOUT )
+                    rem_ttl =self .app_session_ttl_remaining (s_curr )
+                    if not self .app_session_fresh (s_curr )or (rem_ttl is not None and rem_ttl <=300.0 ):
                         s_curr =self .ensure_slot_session (slot )
+                        continue 
                     with self .state_lock :
                         wait =float (self .args .refresh_interval )-(now_f64 ()-self .state .last_business_end_at )
                     if wait >0.0 :
@@ -1727,14 +1756,15 @@ class Resolver :
                 with self .state_lock :
                     self .state .playlist_cache [entry .channel ]=cached 
             return (body ,content_type ,miss_probe )
-    def fetch_channel_playlist (self ,channel :str ,host_header :str )->str :
+    def fetch_channel_playlist (self ,channel :str ,host_header :str ,proto :str ='http')->str :
         with self .state_lock :
             self .state .channel_last_access [channel ]=now_f64 ()
         if self .zap_debounced (channel ):
             log (f'[{channel }] 换台防抖: 先出 1080p, 停留后自动升码率',min_interval =10.0 )
             return None 
         host =host_header .strip ()if host_header else f'localhost:{server_port }'
-        proxy_origin =f'http://{host }'
+        scheme =proto if proto in ('http','https')else 'http'
+        proxy_origin =f'{scheme }://{host }'
         entry =self .ensure_channel (channel )
         for attempt in range (2 ):
             try :
@@ -1797,7 +1827,7 @@ class Resolver :
                 f .flush ()
                 os .fsync (f .fileno ())
             os .replace (tmp_path ,self .args .meta_json )
-        except OSError :
+        except Exception :
             try :
                 if 'tmp_path'in locals ()and os .path .exists (tmp_path ):
                     os .remove (tmp_path )
@@ -1829,38 +1859,49 @@ def _playback_request_headers (playback_headers :dict ,extra :dict |None =None )
         headers .update (extra )
     return headers 
 def fetch_playlist_http1 (final_url :str ,playback_headers :dict ):
-    try :
-        parts =urllib .parse .urlsplit (final_url )
-    except ValueError as e :
-        raise YsptpError (f'invalid final URL: {e }')
-    if parts .scheme !='http':
-        raise YsptpError (f'manual playlist fetch currently expects http URL, got {parts .scheme }')
-    host =parts .hostname 
-    if not host :
-        raise YsptpError ('final URL missing host')
-    port =parts .port or 80 
-    host_header =f'{host }:{parts .port }'if parts .port else host 
-    target =parts .path or '/'
-    if parts .query :
-        target +='?'+parts .query 
-    headers =_playback_request_headers (playback_headers )
-    headers ['Host']=host_header 
-    conn =http .client .HTTPConnection (host ,port ,timeout =20 )
-    try :
+    current_url =final_url 
+    for _ in range (4 ):
         try :
-            conn .request ('GET',target ,headers =headers )
-            resp =conn .getresponse ()
-        except Exception as e :
-            raise YsptpError (_normalize_network_error (e ))
-        status =resp .status 
-        content_type =resp .getheader ('Content-Type')or 'application/vnd.apple.mpegurl'
+            parts =urllib .parse .urlsplit (current_url )
+        except ValueError as e :
+            raise YsptpError (f'invalid final URL: {e }')
+        if parts .scheme not in ('http','https'):
+            raise YsptpError (f'manual playlist fetch currently expects http or https URL, got {parts .scheme }')
+        host =parts .hostname 
+        if not host :
+            raise YsptpError ('final URL missing host')
+        is_https =(parts .scheme =='https')
+        port =parts .port or (443 if is_https else 80 )
+        host_header =f'{host }:{parts .port }'if parts .port else host 
+        target =parts .path or '/'
+        if parts .query :
+            target +='?'+parts .query 
+        headers =_playback_request_headers (playback_headers )
+        headers ['Host']=host_header 
+        if is_https :
+            conn =http .client .HTTPSConnection (host ,port ,timeout =20 ,context =ssl .create_default_context ())
+        else :
+            conn =http .client .HTTPConnection (host ,port ,timeout =20 )
         try :
-            body =resp .read ()
-        except Exception as e :
-            raise YsptpError (_normalize_network_error (e ))
-    finally :
-        conn .close ()
-    return (status ,content_type ,body .decode ('utf-8',errors ='replace'))
+            try :
+                conn .request ('GET',target ,headers =headers )
+                resp =conn .getresponse ()
+            except Exception as e :
+                raise YsptpError (_normalize_network_error (e ))
+            status =resp .status 
+            loc =resp .getheader ('Location')
+            content_type =resp .getheader ('Content-Type')or 'application/vnd.apple.mpegurl'
+            try :
+                body =resp .read ()
+            except Exception as e :
+                raise YsptpError (_normalize_network_error (e ))
+        finally :
+            conn .close ()
+        if status in (301 ,302 ,303 ,307 ,308 )and loc :
+            current_url =urllib .parse .urljoin (current_url ,loc )
+            continue 
+        return (status ,content_type ,body .decode ('utf-8',errors ='replace'))
+    raise YsptpError ('too many redirects fetching playlist')
 def query_param (url :str ,name :str ):
     if '?'not in url :
         return None 
@@ -1992,6 +2033,9 @@ class W :
     def list (self ,items ,tag ,wf ):
         self .head (9 ,tag )
         self .int (len (items ),0 )
+        if wf is not None :
+            for item in items :
+                wf (self ,item )
     def out (self ):
         return bytes (self .b )
 class R :
@@ -2400,23 +2444,35 @@ def parse_catchup_time_val (val_str :str |None )->int |None :
     val =val_str .strip ()
     if not val :
         return None 
-    digits ="".join (c for c in val if c .isdigit ())
+    cst =datetime .timezone (datetime .timedelta (hours =8 ))
+    if 'T'in val or ('-'in val and ':'in val ):
+        try :
+            iso_val =val [:-1 ]+'+00:00'if val .upper ().endswith ('Z')else val 
+            dt =datetime .datetime .fromisoformat (iso_val )
+            if dt .tzinfo is None :
+                dt =dt .replace (tzinfo =cst )
+            return int (dt .timestamp ())
+        except Exception :
+            pass 
+    is_utc =val .upper ().endswith ('Z')
+    clean_val =re .sub (r'\.\d+','',val )
+    digits ="".join (c for c in clean_val if c .isdigit ())
     if not digits :
         return None 
     if len (digits )==10 :
         return int (digits )
     if len (digits )==13 :
         return int (int (digits )/1000 )
-    cst =datetime .timezone (datetime .timedelta (hours =8 ))
-    if len (digits )==14 :
+    tz =datetime .timezone .utc if is_utc else cst 
+    if len (digits )>=14 :
         try :
-            dt =datetime .datetime .strptime (digits ,"%Y%m%d%H%M%S").replace (tzinfo =cst )
+            dt =datetime .datetime .strptime (digits [:14 ],"%Y%m%d%H%M%S").replace (tzinfo =tz )
             return int (dt .timestamp ())
         except Exception :
             pass 
     if len (digits )==12 :
         try :
-            dt =datetime .datetime .strptime (digits ,"%Y%m%d%H%M").replace (tzinfo =cst )
+            dt =datetime .datetime .strptime (digits ,"%Y%m%d%H%M").replace (tzinfo =tz )
             return int (dt .timestamp ())
         except Exception :
             pass 
@@ -2514,6 +2570,10 @@ class TsSegmentCache :
             data ,headers ,expire_at =item 
             if time .time ()>expire_at :
                 self .cache .pop (key ,None )
+                try :
+                    self .order .remove (key )
+                except ValueError :
+                    pass 
                 self .curr_bytes -=len (data )
                 self .misses +=1 
                 return None 
@@ -2526,6 +2586,10 @@ class TsSegmentCache :
             if key in self .cache :
                 old =self .cache .pop (key )
                 self .curr_bytes -=len (old [0 ])
+                try :
+                    self .order .remove (key )
+                except ValueError :
+                    pass 
             now =time .time ()
             while (self .curr_bytes +len (data )>self .max_bytes )and self .order :
                 old_key =self .order .popleft ()
@@ -2579,6 +2643,7 @@ class Channel :
         self .lock =threading .Lock ()
         self .segments ={}
         self .order =deque ()
+        self .seen_keys =deque (maxlen =MAX_SEGS *2 )
         self .seq =0 
         self .last_access =0.0 
         self .thread =None 
@@ -2633,6 +2698,10 @@ def jce_refresh (ch ):
         added =0 
         is_init =not ch .order 
         if is_init :
+            for _ ,pdt ,url in segs :
+                k =seg_key (url ,pdt )
+                if k not in ch .seen_keys :
+                    ch .seen_keys .append (k )
             init_segs =segs [-25 :]if len (segs )>25 else segs 
             for dur ,pdt ,url in init_segs :
                 key =seg_key (url ,pdt )
@@ -2650,6 +2719,9 @@ def jce_refresh (ch ):
                 if key in ch .segments :
                     ch .segments [key ][3 ]=url 
                     continue 
+                if key in ch .seen_keys :
+                    continue 
+                ch .seen_keys .append (key )
                 ch .seq +=1 
                 ch .segments [key ]=[ch .seq ,dur ,pdt ,url ]
                 ch .order .append (key )
@@ -2671,7 +2743,7 @@ def bk_refresh (ch ):
         log (f'[{ch .slug }] bkliveinfo 备用通道就绪 ({len (ch .bk_urls )} 地址)',min_interval =60.0 )
     last_err =''
     for attempt in range (2 ):
-        for u in ch .bk_urls :
+        for u in list (ch .bk_urls ):
             try :
                 pl =fetch_abs_playlist (u )
                 if '#EXTM3U'not in pl :
@@ -2716,6 +2788,9 @@ def refresh_once (ch ):
 def refresh_loop (ch ):
     log (f'[{ch .slug }] {defn_label (ch .defn )} 后台拉取启动 [{ch .mode }]',min_interval =10.0 )
     fails =0 
+    if time .time ()-ch .last_ok <REFRESH_INTERVAL :
+        build_playlist (ch ,holdback =True )
+        time .sleep (REFRESH_INTERVAL )
     while time .time ()-ch .last_access <IDLE_TIMEOUT :
         ok =refresh_once (ch )
         if ok :
@@ -2726,23 +2801,29 @@ def refresh_loop (ch ):
 def ensure_channel (ch ):
     now =time .time ()
     ch .last_access =now 
+    wait_only =False 
     with ch .lock :
         if ch ._starting :
-            return 
-        thread_dead =ch .thread is None or not ch .thread .is_alive ()
-        cache_stale =now -ch .last_ok >30.0 or (not ch .segments and (not ch .bk_playlist ))
-        if cache_stale :
-            ch .segments .clear ()
-            ch .order .clear ()
-            ch .last_pdt =''
-            ch .bk_playlist =''
-            need_fetch =True 
+            wait_only =True 
         else :
-            need_fetch =False 
-        if need_fetch or thread_dead :
-            ch ._starting =True 
-        else :
-            return 
+            thread_dead =ch .thread is None or not ch .thread .is_alive ()
+            cache_stale =now -ch .last_ok >IDLE_TIMEOUT or (not ch .segments and (not ch .bk_playlist ))
+            if cache_stale :
+                ch .segments .clear ()
+                ch .order .clear ()
+                ch .seen_keys .clear ()
+                ch .last_pdt =''
+                ch .bk_playlist =''
+                need_fetch =True 
+            else :
+                need_fetch =False 
+            if need_fetch or thread_dead :
+                ch ._starting =True 
+            else :
+                return 
+    if wait_only :
+        coalesce_refresh (ch .slug ,lambda :refresh_once (ch ),timeout =5.0 )
+        return 
     try :
         if need_fetch :
             coalesce_refresh (ch .slug ,lambda :refresh_once (ch ),timeout =5.0 )
@@ -2821,8 +2902,44 @@ def get_channel_instance (slug :str )->Channel |None :
         return ch 
     return None 
 engine_port =8787 
-def fetch_upstream_engine_playlist (canonical :str ,host :str )->str |None :
+ALLOWED_ENGINE_PROXY_SUFFIXES =('.cctv.cn','.cctv.com','.cctvpic.com','.citvc.com','.yangshipin.cn','.cntv.cn','.cntv.com','.myqcloud.com','.qqlive.com','.gtimg.cn','.smtcdns.net','.smtcdns.com','.tcdnlive.com','.alicdn.com','.alikunlun.com','.wscdns.com','.chinanetcenter.com','.bdydns.com','.ksyungslb.com','.ks-cdn.com')
+def _is_safe_engine_proxy_url (target :str ,_depth :int =0 )->bool :
+    if _depth >2 :
+        return False 
+    try :
+        parsed =urllib .parse .urlsplit (target )
+    except ValueError :
+        return False 
+    if parsed .scheme not in ('http','https'):
+        return False 
+    host =(parsed .hostname or '').lower ()
+    if not host :
+        return False 
+    if host in ('127.0.0.1','localhost'):
+        if parsed .port !=engine_port or not parsed .path .startswith ('/segment'):
+            return False 
+        qs =urllib .parse .parse_qs (parsed .query )
+        inner =qs .get ('url',[None ])[0 ]
+        return bool (inner )and _is_safe_engine_proxy_url (inner ,_depth +1 )
+    return any ((host ==s [1 :]or host .endswith (s )for s in ALLOWED_ENGINE_PROXY_SUFFIXES ))
+def inject_hls_discontinuity (pl :str )->str :
+    if '#EXT-X-DISCONTINUITY'in pl :
+        return pl 
+    lines =pl .splitlines ()
+    out =[]
+    inserted =False 
+    for line in lines :
+        s =line .strip ()
+        if not inserted and (s .startswith ('#EXT-X-PROGRAM-DATE-TIME:')or s .startswith ('#EXTINF:')or (s and not s .startswith ('#'))):
+            out .append ('#EXT-X-DISCONTINUITY')
+            inserted =True 
+        out .append (line )
+    if not inserted :
+        return pl 
+    return '\n'.join (out )+('\n'if pl .endswith ('\n')else '')
+def fetch_upstream_engine_playlist (canonical :str ,host :str ,proto :str ='http')->str |None :
     global engine_port 
+    scheme =proto if proto in ('http','https')else 'http'
     for u in (f'http://127.0.0.1:{engine_port }/live/{canonical }.m3u8',f'http://127.0.0.1:{engine_port }/{canonical }.m3u8'):
         try :
             req =urllib .request .Request (u ,headers ={'User-Agent':UA })
@@ -2830,7 +2947,7 @@ def fetch_upstream_engine_playlist (canonical :str ,host :str )->str |None :
                 if resp .status ==200 :
                     text =resp .read ().decode ('utf-8',errors ='ignore')
                     if '#EXTM3U'in text :
-                        base_prefix =f'http://{host }/engine_proxy?url='
+                        base_prefix =f'{scheme }://{host }/engine_proxy?url='
                         out_lines =[]
                         for line in text .splitlines ():
                             line_str =line .strip ()
@@ -2849,7 +2966,7 @@ def fetch_upstream_engine_playlist (canonical :str ,host :str )->str |None :
             pass 
     return None 
 class Handler (BaseHTTPRequestHandler ):
-    server_version ='ysp-live/9.4.0'
+    server_version ='ysp-live/9.5.0'
     def log_message (self ,fmt ,*args ):
         pass 
     def _send (self ,code ,body ,ctype ='text/plain; charset=utf-8',head_only =False ,extra_headers =None ):
@@ -2901,7 +3018,7 @@ class Handler (BaseHTTPRequestHandler ):
             active_slots =len ([s for s in (resolver .state .sessions .values ()if resolver else [])if s and resolver .app_session_fresh (s )])
             health_data ={
             "ok":True ,
-            "version":"9.4.0",
+            "version":"9.5.0",
             "author_community":AUTHOR_COMMUNITY ,
             "author_channel":AUTHOR_CHANNEL ,
             "notice":"其他渠道均非作者发布！",
@@ -2921,7 +3038,7 @@ class Handler (BaseHTTPRequestHandler ):
             return 
         if path =='/all.m3u':
             host =self .headers .get ('Host',f'localhost:{server_port }')
-            proto =self .headers .get ('X-Forwarded-Proto','http')
+            proto =self .headers .get ('X-Forwarded-Proto','http').split (',')[0 ].strip ().lower ()or 'http'
             qs =urllib .parse .parse_qs (parts .query )
             target_group =qs .get ('group',[None ])[0 ]
             k4_val =qs .get ('k4',['0'])[0 ].lower ()
@@ -2953,7 +3070,7 @@ class Handler (BaseHTTPRequestHandler ):
             info =[]
             now =time .time ()
             info .append ("====================================================")
-            info .append (f"ysp-live v9.4 诊断报告 (运行时间: {int (now -server_start_time )}s)")
+            info .append (f"ysp-live v9.5 诊断报告 (运行时间: {int (now -server_start_time )}s)")
             info .append ("📢 首发地址")
             info .append (f"社区：Gary's Club ({AUTHOR_COMMUNITY})")
             info .append (f"频道：Gary's Club Channel ({AUTHOR_CHANNEL})")
@@ -2961,10 +3078,12 @@ class Handler (BaseHTTPRequestHandler ):
             info .append ("====================================================")
             engine_status ='就绪'if resolver_ready ()else '未就绪(1080p自动回退)'
             s0 =resolver .state .sessions .get (0 )if resolver else None 
+            if s0 and resolver :
+                resolver .evict_idle_links (s0 ,LINK_IDLE_TIMEOUT )
             links_limit_cfg =getattr (resolver .args ,'links_per_device',6 )if resolver else 6 
-            info .append (f"ysp-live v9.4 诊断报告 (运行时间: {int (now -server_start_time )}s)")
+            pool_ch_count =len (active_backend_channels )
             info .append (f"单设备并发池状态: {engine_status }")
-            info .append (f"高码率设备状态 (26 路共用): {('有效'if s0 and resolver and resolver .app_session_fresh (s0 )else '未就绪')}, 占用={len (s0 .linked_channels )if s0 else 0 }/{links_limit_cfg }, 心跳={(s0 .heartbeat_count if s0 else 0 )}, GUID={(s0 .cloud_guid if s0 else '无')}")
+            info .append (f"高码率设备状态 ({pool_ch_count } 路共用): {('有效'if s0 and resolver and resolver .app_session_fresh (s0 )else '未就绪')}, 占用={len (s0 .linked_channels )if s0 else 0 }/{links_limit_cfg }, 心跳={(s0 .heartbeat_count if s0 else 0 )}, GUID={(s0 .cloud_guid if s0 else '无')}")
             if s0 and s0 .last_heartbeat_error :
                 info .append (f'Slot 0 心跳日志: {s0 .last_heartbeat_error }')
             c_stats =global_ts_cache .stats ()
@@ -3000,7 +3119,8 @@ class Handler (BaseHTTPRequestHandler ):
             except YsptpError as err :
                 self ._send (400 ,f'{err }\n',head_only =head_only )
                 return 
-            cached_item =global_ts_cache .get (real_url )
+            range_header =self .headers .get ('Range')
+            cached_item =global_ts_cache .get (real_url )if not range_header else None 
             if cached_item is not None :
                 cached_bytes ,cached_headers =cached_item 
                 try :
@@ -3034,7 +3154,6 @@ class Handler (BaseHTTPRequestHandler ):
                 if parts_url .query :
                     target +='?'+parts_url .query 
                 extra ={}
-                range_header =self .headers .get ('Range')
                 if range_header :
                     extra ['Range']=header_value_clean (range_header )
                 headers =_playback_request_headers (playback_headers ,extra )
@@ -3050,7 +3169,7 @@ class Handler (BaseHTTPRequestHandler ):
                     resp_headers_to_pass ={}
                     for k ,v in resp .getheaders ():
                         kl =k .lower ()
-                        if kl in ('content-type','content-range','accept-ranges','content-length'):
+                        if kl in ('content-type','content-range','accept-ranges','content-length','location'):
                             resp_headers_to_pass [k ]=v 
                     self .send_response (resp .status )
                     for k ,v in resp_headers_to_pass .items ():
@@ -3101,10 +3220,16 @@ class Handler (BaseHTTPRequestHandler ):
             if not target :
                 self ._send (400 ,'missing url\n',head_only =head_only )
                 return 
+            if not _is_safe_engine_proxy_url (target ):
+                self ._send (403 ,'forbidden url\n',head_only =head_only )
+                return 
             try :
                 req =urllib .request .Request (target ,headers ={'User-Agent':UA ,'Accept':'*/*'})
                 with urllib .request .urlopen (req ,timeout =10.0 )as resp :
-                    data =resp .read ()
+                    data =resp .read (35 *1024 *1024 +1 )
+                    if len (data )>35 *1024 *1024 :
+                        self ._send (502 ,'upstream segment too large\n',head_only =head_only )
+                        return 
                     self ._send (resp .status ,data ,resp .headers .get ('Content-Type','video/mp2t'),head_only =head_only )
             except Exception as e :
                 self ._send (502 ,f'engine proxy error: {e }\n',head_only =head_only )
@@ -3117,6 +3242,7 @@ class Handler (BaseHTTPRequestHandler ):
             if not ch :
                 self ._send (404 ,'未知频道\n',head_only =head_only )
                 return 
+            proto =self .headers .get ('X-Forwarded-Proto','http').split (',')[0 ].strip ().lower ()or 'http'
             if catchup_times and (canonical in TIMESHIFT_SUPPORTED ):
                 start_ts ,end_ts =catchup_times 
                 try :
@@ -3130,7 +3256,7 @@ class Handler (BaseHTTPRequestHandler ):
                 if not resolver .is_channel_in_cooldown (canonical ):
                     try :
                         host =self .headers .get ('Host',f'localhost:{server_port }')
-                        pl =resolver .fetch_channel_playlist (canonical ,host )
+                        pl =resolver .fetch_channel_playlist (canonical ,host ,proto )
                         if pl and '#EXTM3U'in pl :
                             with ch .lock :
                                 prev_src =getattr (ch ,'last_m3u8_source',None )
@@ -3138,7 +3264,7 @@ class Handler (BaseHTTPRequestHandler ):
                                 ch .last_built_playlist =''
                                 ch .last_built_time =0.0 
                             if prev_src =='bk':
-                                pl =pl .replace ('#EXTM3U','#EXTM3U\n#EXT-X-DISCONTINUITY',1 )
+                                pl =inject_hls_discontinuity (pl )
                             self ._send (200 ,pl ,'application/vnd.apple.mpegurl',head_only =head_only )
                             return 
                     except Exception as e :
@@ -3168,7 +3294,7 @@ class Handler (BaseHTTPRequestHandler ):
                     prev_src =getattr (ch ,'last_m3u8_source',None )
                     ch .last_m3u8_source ='bk'
                 if prev_src =='device':
-                    cached_pl =cached_pl .replace ('#EXTM3U','#EXTM3U\n#EXT-X-DISCONTINUITY',1 )
+                    cached_pl =inject_hls_discontinuity (cached_pl )
                 self ._send (200 ,cached_pl ,'application/vnd.apple.mpegurl',head_only =head_only ,extra_headers ={'X-SWR':'HIT'})
                 if cached_age >6.0 :
                     trigger_background_refresh (ch )
@@ -3180,10 +3306,10 @@ class Handler (BaseHTTPRequestHandler ):
                     prev_src =getattr (ch ,'last_m3u8_source',None )
                     ch .last_m3u8_source ='bk'
                 if prev_src =='device':
-                    pl =pl .replace ('#EXTM3U','#EXTM3U\n#EXT-X-DISCONTINUITY',1 )
+                    pl =inject_hls_discontinuity (pl )
                 self ._send (200 ,pl ,'application/vnd.apple.mpegurl',head_only =head_only )
                 return 
-            upstream_pl =fetch_upstream_engine_playlist (canonical ,self .headers .get ('Host',f'localhost:{server_port }'))
+            upstream_pl =fetch_upstream_engine_playlist (canonical ,self .headers .get ('Host',f'localhost:{server_port }'),proto )
             if upstream_pl and '#EXTM3U'in upstream_pl :
                 self ._send (200 ,upstream_pl ,'application/vnd.apple.mpegurl',head_only =head_only )
                 return 
@@ -3199,7 +3325,7 @@ def init_resolver ():
         try :
             resolver .ensure_slot_session (0 )
             set_resolver_ready (True )
-            log ('[系统] 设备身份就绪，高码率并发池已激活 (全部 26 路按需解析)')
+            log (f'[系统] 设备身份就绪，高码率并发池已激活 (全部 {len (active_backend_channels )} 路按需解析)')
             break 
         except Exception as e :
             retry_count +=1 
@@ -3286,7 +3412,7 @@ def main ():
     global resolver ,server_port ,engine_port ,global_channel_dir ,global_ts_cache 
     if os.name == 'nt':
         os.system('') 
-    ap =argparse .ArgumentParser (description ='央视频全频道直播代理（ysp-live v9.4）')
+    ap =argparse .ArgumentParser (description ='央视频全频道直播代理（ysp-live v9.5）')
     ap .add_argument ('port',nargs ='?',type =int ,default =8767 ,help ='监听端口 (默认 8767)')
     ap .add_argument ('--bind',default ='0.0.0.0',help ='监听地址 (默认 0.0.0.0)')
     ap .add_argument ('--data-dir',default =os .environ .get ('YSP_DATA_DIR',''),help ='数据持久化目录 (默认由 YSP_DATA_DIR 环境变量或脚本所在目录决定)')
@@ -3323,7 +3449,10 @@ def main ():
     global active_backend_channels 
     only_4k_mode =args .only_4k or (os .environ .get ('YSP_ONLY_4K_DEVICE','').lower ()in ('1','true','yes'))
     links_limit =max (0 ,int (args .links_per_device ))
-    if only_4k_mode :
+    if args .no_4k :
+        active_backend_channels =set ()
+        log ('[系统] 高码率模式: 已禁用 (--no-4k)，全频道走 1080p JCE/bkliveinfo')
+    elif only_4k_mode :
         active_backend_channels =set (TRUE_4K_CHANNELS )
         log ('[系统] 高码率模式: 仅 4K/8K 频道走设备协议 (其余走 1080p JCE/bkliveinfo)')
     else :
@@ -3338,7 +3467,8 @@ def main ():
     heartbeat_ttl_guard =60.0 ,session_ttl =7200.0 ,
     meta_json =os .path .join (data_dir ,'proxy-cache-state-rs.json'),
     device_json =os .path .join (data_dir ,'device-state-rs.json'),
-    links_per_device =links_limit 
+    links_per_device =links_limit ,
+    zap_debounce =float (args .zap_debounce )
     )
     resolve_paths (engine_args )
     resolver =Resolver (engine_args )
@@ -3354,7 +3484,7 @@ def main ():
     RESET = '\033[0m'
 
     log ('====================================================================')
-    log (f'ysp-live v9.4 启动成功: {channels_count } 个独立频道 (央视 {c_yangshi } 路, 卫视 {c_weishi } 路)')
+    log (f'ysp-live v9.5 启动成功: {channels_count } 个独立频道 (央视 {c_yangshi } 路, 卫视 {c_weishi } 路)')
     log (f'全频道订阅:   http://localhost:{args .port }/all.m3u')
     log (f'系统健康度:   http://localhost:{args .port }/health')
     log (f'实时诊断日志: http://localhost:{args .port }/diag')
