@@ -12,7 +12,7 @@
       "url": "https://capi.yangshipin.cn/api/oms/pc/navigation/home_top_nav",
       "api": "./live/yangshipin.py",
       "ext": "./live/yangshipin.json",
-      "epg": "https://github.com/litiande03/epg/raw/refs/heads/master/pl.xml.gz",
+      "epg": "https://epg.136605.xyz/1day.xml.gz",
       "timeZone": "Asia/Shanghai",
       "timeout": 30
     },
