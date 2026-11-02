@@ -17,6 +17,10 @@ const KEYGEN_EXPORTS = {
 };
 const EPG_URL = 'https://api.cntv.cn/epg/getEpgInfoByChannelNew';
 const HLS_MIME = 'application/x-mpegURL';
+const AUTO_SOURCE_MS = 8000;
+const AUTO_CHOICE_MS = 300000;
+const PLAY_SESSION_MS = 7200000;
+const AUTO_FAILURE_MS = 30000;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36';
 const YSP_APP_ID = '519748109';
 const APP_VERSION = 'V1.0.0';
@@ -29,6 +33,10 @@ const TV_APP_ID = "9f5c54c4ed0e50109b800f7e28fec205";
 const TV_VERSION = "1.4.1";
 const TV_BASE = "https://ytpaddr.cctv.cn/gsnw/";
 const TV_CLOUD = "https://ytpcloudws.cctv.cn/cloudps/wssapi/device/v2/";
+const TV_DEVICE_CODES = new Map([
+    [TV_CLOUD + 'get', ['0', '2', '601']],
+    [TV_CLOUD + 'register', ['0', '2', '694']],
+]);
 const TV_REPORT = "https://ytpdata.cctv.cn/das/app/data/message/single";
 const TV_VDN = "https://ytpvdn.cctv.cn/cctvmobileinf/rest/cctv/videoliveUrl/getstream";
 const TV_PUBLIC_KEY = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAkKeLy4ywWLSnBkwRyqYgF3HMIj05V5uuh5HjyEsZOWnu1NHu3jPQv3sr32wwQNYv5qapsNXmNgLUDHtgHZxqPQAYXltjSRc0qhcD286t62wOIHId8zXS3s1Jy4rgU4qjQWzI9rp/1sE0pMsmwTaJa4zuJ5iz8VwF8Av5oJ1k+HxY+/HLnjNlW1hmWLpuDYmkZYuAoTHa1VGeHQh9FEKI8ZcL3GTQphShUoC+Kg3P1hGUVTtCYapmzPS5lkAdwebuzwvTCfGiTErYZCnPBUSeV7BVlgjtLYIi29KvF0a8FHsJMfe/UdHcyW/RihsIYOtDQcRRpFGXyPXbVrzFJse24QIDAQAB";
@@ -126,6 +134,12 @@ function remaining(deadline, stage) {
     const timeout = deadline - Date.now();
     if (timeout <= 0) throw new ProxyError(504, stage + ': 取址逾時');
     return Math.min(timeout, 15000);
+}
+
+function mediaUrl(location, data) {
+    const extension = data.extended_param ?? '';
+    if (typeof extension !== 'string' || (extension && !extension.startsWith('&'))) throw new ProxyError(502, '播放地址: invalid media parameters');
+    return location + (location.includes('?') || !extension ? extension : '?' + extension.slice(1));
 }
 
 function jsonObject(content, stage) {
@@ -553,7 +567,7 @@ class AppPlayerApi {
         if (!url) throw new ProxyError(502, 'App 直播取址: no usable HLS URL');
         const headers = value.http_header === undefined ? {} : value.http_header;
         if (!headers || typeof headers !== 'object' || Array.isArray(headers) || Object.entries(headers).some(([key, value]) => typeof value !== 'string')) throw new ProxyError(502, 'App 直播取址: invalid playback headers');
-        return {url, headers: {'User-Agent': 'qqlive', Referer: 'https://live.cctv.cn/', ...headers}};
+        return {url: mediaUrl(url, value), headers: {'User-Agent': 'qqlive', Referer: 'https://live.cctv.cn/', ...headers}};
     }
 }
 
@@ -619,6 +633,20 @@ class TvPlayerApi {
                 'Content-Type': form ? 'application/x-www-form-urlencoded' : 'application/json', ...headers,
             },
         });
+        const codes = TV_DEVICE_CODES.get(url);
+        if (codes && reply.code === 400 && !reply.error) {
+            let value;
+            try {
+                value = jsonObject(reply.content, stage);
+            } catch (error) {
+                throw new ProxyError(400, stage + ': HTTP 400; ' + error.message);
+            }
+            if (codes.includes(String(value.result ?? value.code))) {
+                this.owner.assertActive();
+                remaining(deadline, stage);
+                return value;
+            }
+        }
         this.owner.checkResponse(reply, stage);
         remaining(deadline, stage);
         return jsonObject(reply.content, stage);
@@ -667,7 +695,7 @@ class TvPlayerApi {
 
     async resolve(liveId, deadline) {
         try {
-            if (!this.sessionKey || Date.now() - this.createdAt >= 7200000) await this.bootstrap(deadline);
+            if (!this.sessionKey || Date.now() - this.createdAt >= PLAY_SESSION_MS) await this.bootstrap(deadline);
             await this.heartbeat(deadline);
             const body = {screenParam: '7680-4320-280', rate: '', systemType: 'ios', model: 'XR-85Z9K', id: liveId,
                 userId: 'BAEBFF2B-C516-4F34-ABC0-A824A6461CBD', clientSign: 'cctvVideo', deviceId: {serial: '', imei: '', android_id: ''}};
@@ -676,8 +704,7 @@ class TvPlayerApi {
             if (!Array.isArray(videos)) throw new ProxyError(502, '電視端畫質列表: missing videos');
             const candidates = videos.filter(item => item && typeof item.url === 'string' && item.url);
             if (!candidates.length) throw new ProxyError(502, '電視端畫質列表: no usable URL');
-            const bitrate = item => Number(/^(\d+)p$/.exec(String(item.rate))?.[1] || 0);
-            const video = candidates.reduce((best, item) => bitrate(item) > bitrate(best) ? item : best);
+            const video = candidates.find(item => item.rate === '36p') || candidates[0];
             const rawUrl = /^https?:\/\//.test(video.url) ? video.url : await decryptGcm(video.url, this.sessionKey);
             const two = this.data(await this.request(TV_BASE + 'api/live/v1/02', {guid: await encryptGcm('', this.sessionKey)}, deadline, '電視端播放授權'), '電視端播放授權');
             const secret = await decryptGcm(typeof two === 'string' ? two : two?.appSecret ?? two?.app_secret, this.sessionKey);
@@ -754,11 +781,9 @@ export default class Yangshipin extends Spider {
         const item = {
             name, tvgName: XMLTV_NAMES.get(name) || name, tvgId: channel.pid, number: String(number).padStart(2, '0'),
             logo: logo ? 'https://epg.112114.xyz/logo/' + encodeURIComponent(logo) + '.png' : channel.logo,
-            format: HLS_MIME, ua: USER_AGENT,
-            urls: [this.proxyUrl({type: 'app', pid: channel.pid, cnlid: channel.cnlid, defn: channel.vip ? 'shd' : 'fhd'}) + '$手機',
-                this.proxyUrl({cmg: '1', pid: channel.pid, cnlid: channel.cnlid}) + '$網頁'],
+            format: HLS_MIME, ua: USER_AGENT, referer: HOST + '/',
+            urls: [this.proxyUrl({type: 'auto', pid: channel.pid, cnlid: channel.cnlid, defn: channel.vip ? 'shd' : 'fhd', cmg: '1'})],
         };
-        if (TV_CHANNELS.has(channel.pid)) item.urls.unshift(this.proxyUrl({type: 'tv', pid: channel.pid, cnlid: channel.cnlid}) + '$電視');
         if (id) item.epg = this.proxyUrl({type: 'epg', id}) + '&date={date}';
         return item;
     }
@@ -771,7 +796,8 @@ export default class Yangshipin extends Spider {
                 this.assertActive();
                 return [200, 'application/json', content];
             }
-            if (params.type === 'app' || params.type === 'tv') return await this.proxyLive(params);
+            if (params.type === 'auto') return await this.proxyAuto(params);
+            if (['app', 'tv', 'web'].includes(params.type)) return await this.proxyLive(params);
             const refresh = String(params['cache-control'] || '').toLowerCase().replace(/ /g, '').split(',').includes('no-cache');
             const location = await this.resolve(params.pid, params.cnlid, refresh);
             this.assertActive();
@@ -826,7 +852,7 @@ export default class Yangshipin extends Spider {
             }
         }));
         this.assertActive();
-        return entry;
+        return {...entry, cacheKey: key};
     }
 
     async appEntry(pid, cnlid, definition, deadline, refresh) {
@@ -836,17 +862,113 @@ export default class Yangshipin extends Spider {
         if (refresh) this.net.clearCache(key);
         const entry = await this.net.cached(key, {ttl: 60000, stale: false}, () => new AppPlayerApi(this).resolve(pid, cnlid, definition, deadline));
         this.assertActive();
-        return entry;
+        return {...entry, cacheKey: key};
+    }
+
+    async liveEntry(source, params, deadline, refresh = false) {
+        const {pid, cnlid} = params, definition = params.defn ?? 'fhd';
+        let entry;
+        if (source === 'tv') entry = await this.tvEntry(pid, cnlid, deadline, refresh);
+        else if (source === 'app') entry = await this.appEntry(pid, cnlid, definition, deadline, refresh);
+        else entry = {url: await this.resolve(pid, cnlid, refresh, deadline), headers: this.playerHeaders(), cacheKey: 'play:' + pid + ':' + cnlid};
+        const generation = md5X(entry.url + '\n' + canonicalQuery(entry.headers));
+        return {...entry, source, pid, cnlid, defn: definition, generation};
+    }
+
+    autoKey(params) {
+        return 'auto:' + params.pid + ':' + params.cnlid + ':' + (params.defn ?? 'fhd');
+    }
+
+    sourceFailure(params, source) {
+        return this.net.cached(this.autoKey(params) + ':' + source, {ttl: AUTO_FAILURE_MS, stale: false}, () => '');
+    }
+
+    entryKey(params) {
+        return this.autoKey(params) + ':entry:' + params.type + ':' + params.generation;
+    }
+
+    async resourceEntry(params, deadline) {
+        return this.net.cached(this.entryKey(params), {ttl: PLAY_SESSION_MS, stale: false}, async () => {
+            const entry = await this.liveEntry(params.type, params, deadline);
+            if (entry.generation !== params.generation) throw new ProxyError(410, '播放來源已更新，請重新播放');
+            return entry;
+        });
+    }
+
+    async failSource(params, source, error, entry) {
+        this.assertActive();
+        if (error?.name === 'AbortError' || /CancellationException|InterruptedException/.test(String(error))) throw error;
+        if (entry) {
+            if (params.generation) {
+                const choice = await this.net.cached(this.autoKey(params), {ttl: AUTO_CHOICE_MS, stale: false}, () => ({source, generation: entry.generation}));
+                if (choice.source !== source || choice.generation !== params.generation) return;
+            }
+            this.net.clearCache(entry.cacheKey);
+        }
+        const message = String(error.message || error).split('\n', 1)[0].replace(/https?:\/\/[^\s]+/g, '[網址]').slice(0, 160);
+        const key = this.autoKey(params) + ':' + source;
+        this.net.clearCache(key);
+        await this.net.cached(key, {ttl: AUTO_FAILURE_MS, stale: false}, () => message);
+        console.warn('央視頻 ' + source + ': ' + message);
+    }
+
+    async proxyAuto(params) {
+        this.assertActive();
+        if (!isChannelId(params.pid) || !isChannelId(params.cnlid) || !['fhd', 'shd'].includes(params.defn ?? 'fhd') || params.url || (params.kind ?? 'playlist') !== 'playlist' || params.generation) throw new ProxyError(400, 'invalid automatic playback request');
+        const deadline = Date.now() + 25000;
+        const sources = [...(TV_CHANNELS.has(params.pid) ? ['tv'] : []), 'web', 'app'];
+        const key = this.autoKey(params);
+        const choice = await this.net.cached(key, {ttl: AUTO_CHOICE_MS, stale: false}, () => ({source: sources[0], generation: ''}));
+        const index = sources.indexOf(choice.source);
+        if (index >= 0) sources.unshift(...sources.splice(index, 1));
+        const refresh = String(params['cache-control'] || '').toLowerCase().replace(/ /g, '').split(',').includes('no-cache');
+        const errors = [];
+        for (const source of sources) {
+            this.assertActive();
+            const failure = await this.sourceFailure(params, source);
+            if (failure) {
+                errors.push(source + ': ' + failure);
+                continue;
+            }
+            remaining(deadline, '自動播放取址');
+            const attemptDeadline = Math.min(deadline, Date.now() + AUTO_SOURCE_MS);
+            let entry;
+            try {
+                entry = await this.liveEntry(source, params, attemptDeadline, refresh);
+                await this.proxyEntry(entry, params, attemptDeadline, true);
+                this.assertActive();
+                const selected = {source, generation: entry.generation};
+                if (selected.source !== choice.source || selected.generation !== choice.generation) {
+                    this.net.clearCache(key);
+                    await this.net.cached(key, {ttl: AUTO_CHOICE_MS, stale: false}, () => selected);
+                }
+                const target = {type: source, pid: entry.pid, cnlid: entry.cnlid, defn: entry.defn, generation: entry.generation};
+                return [302, 'text/plain', '', {Location: this.proxyUrl(target), 'Cache-Control': 'no-store'}];
+            } catch (error) {
+                await this.failSource(params, source, error, entry);
+                errors.push(source + ': ' + await this.sourceFailure(params, source));
+            }
+        }
+        throw new ProxyError(502, '所有播放來源均失敗（' + errors.join('；') + '）');
     }
 
     async proxyLive(params) {
         const {pid, cnlid} = params, source = params.type, definition = params.defn ?? 'fhd', kind = params.kind ?? 'playlist';
-        if (!['app', 'tv'].includes(source) || !['playlist', 'segment'].includes(kind)) throw new ProxyError(400, 'invalid playback resource type');
+        if (!['app', 'tv', 'web'].includes(source) || !['playlist', 'segment'].includes(kind)) throw new ProxyError(400, 'invalid playback resource type');
         if (params.url && !isPlaybackUrl(params.url)) throw new ProxyError(400, 'invalid playback URL');
         const deadline = Date.now() + 25000;
-        const refresh = !params.url && String(params['cache-control'] || '').toLowerCase().replace(/ /g, '').split(',').includes('no-cache');
-        const key = source === 'tv' ? this.tvCachePrefix + pid : 'appplay:' + pid + ':' + cnlid + ':' + definition;
-        const entry = source === 'tv' ? await this.tvEntry(pid, cnlid, deadline, refresh) : await this.appEntry(pid, cnlid, definition, deadline, refresh);
+        if (!isChannelId(pid) || !isChannelId(cnlid) || !['fhd', 'shd'].includes(definition)) throw new ProxyError(400, 'invalid playback channel id');
+        const entry = params.generation ? await this.resourceEntry(params, deadline) : await this.liveEntry(source, params, deadline);
+        try {
+            return await this.proxyEntry(entry, params, deadline);
+        } catch (error) {
+            await this.failSource(params, source, error, entry);
+            throw error;
+        }
+    }
+
+    async proxyEntry(entry, params, deadline, probe = false) {
+        const {source, pid, cnlid} = entry, kind = params.kind ?? 'playlist';
         const url = params.url || entry.url;
         if (!isPlaybackUrl(url)) throw new ProxyError(400, 'invalid playback URL');
         const headers = {...entry.headers};
@@ -857,6 +979,7 @@ export default class Yangshipin extends Spider {
             const reply = await this.net.stream(url, {headers, timeout: Math.min(15000, milliseconds), callTimeout: milliseconds});
             try {
                 this.assertActive();
+                if (reply.code >= 400) await this.failSource(params, source, new ProxyError(reply.code, '直播切片: HTTP ' + reply.code), entry);
                 return [reply.code, reply.contentType, reply.stream, reply.headers];
             } catch (error) {
                 reply.stream.close();
@@ -872,15 +995,59 @@ export default class Yangshipin extends Spider {
                 throw error;
             }
         });
-        let playlist;
-        try {
-            playlist = await this.fetchPlaylist(url, headers, deadline);
-        } catch (error) {
-            this.net.clearCache(key);
-            throw error;
-        }
-        const content = this.rewritePlaylist(playlist.text, playlist.url, pid, cnlid, source, definition);
+        if (String(params['cache-control'] || '').toLowerCase().replace(/ /g, '').split(',').includes('no-cache')) headers['Cache-Control'] = 'no-cache';
+        const playlist = await this.fetchPlaylist(url, headers, deadline);
+        if (probe) await this.probePlaylist(playlist.text, playlist.url, headers, deadline);
+        const target = {type: source, pid, cnlid, defn: entry.defn, generation: entry.generation};
+        await this.net.cached(this.entryKey(target), {ttl: PLAY_SESSION_MS, stale: false}, () => entry);
+        const content = this.rewritePlaylist(playlist.text, playlist.url, target);
         return [200, HLS_MIME, content, {'Cache-Control': 'no-store'}];
+    }
+
+    async probePlaylist(playlist, baseUrl, headers, deadline) {
+        for (let count = 0; count < 3; count++) {
+            let variant = false, uri;
+            for (const raw of playlist.split(/\r?\n/)) {
+                const line = raw.trim();
+                if (line.startsWith('#EXT-X-STREAM-INF:')) variant = true;
+                else if (line && !line.startsWith('#')) {
+                    uri = line;
+                    break;
+                }
+            }
+            if (!uri) throw new ProxyError(502, '直播 HLS: missing media URI');
+            const url = new URL(uri, baseUrl).href;
+            if (!isPlaybackUrl(url)) throw new ProxyError(502, '直播 HLS: invalid media URL');
+            if (variant || new URL(url).pathname.toLowerCase().endsWith('.m3u8')) {
+                const next = await this.fetchPlaylist(url, headers, deadline);
+                playlist = next.text;
+                baseUrl = next.url;
+                continue;
+            }
+            for (const match of playlist.matchAll(/#EXT-X-(?:KEY|MAP):[^\r\n]*?URI="([^"]+)"/g)) {
+                const resource = new URL(match[1], baseUrl).href;
+                if (!isPlaybackUrl(resource)) throw new ProxyError(502, '直播 HLS: invalid media URL');
+                await this.probeMedia(resource, headers, deadline);
+            }
+            await this.probeMedia(url, headers, deadline);
+            return;
+        }
+        throw new ProxyError(502, '直播 HLS: playlist nesting too deep');
+    }
+
+    async probeMedia(url, headers, deadline) {
+        const milliseconds = remaining(deadline, '直播切片驗證');
+        const reader = await this.net.openStream(url, {headers, timeout: milliseconds, callTimeout: milliseconds});
+        try {
+            if (![200, 206].includes(reader.code)) throw new ProxyError(502, '直播切片驗證: HTTP ' + reader.code);
+            if (/^(text\/html|application\/json)/i.test(reader.contentType)) throw new ProxyError(502, '直播切片驗證: unexpected content type');
+            const chunk = await reader.read(1);
+            if (!chunk?.byteLength) throw new ProxyError(502, '直播切片驗證: empty response');
+            this.assertActive();
+            remaining(deadline, '直播切片驗證');
+        } finally {
+            reader.close();
+        }
     }
 
     async fetchPlaylist(url, headers, deadline) {
@@ -903,12 +1070,12 @@ export default class Yangshipin extends Spider {
         throw new ProxyError(502, '直播 HLS: too many redirects');
     }
 
-    rewritePlaylist(playlist, baseUrl, pid, cnlid, source, definition) {
+    rewritePlaylist(playlist, baseUrl, target) {
         const proxy = (value, kind) => {
             const url = new URL(value, baseUrl).href;
             if (!isPlaybackUrl(url)) throw new ProxyError(502, '直播 HLS: invalid resource URL');
-            const params = {type: source, pid, cnlid, kind, url};
-            if (source === 'app') params.defn = definition;
+            if (target.type === 'web' && kind === 'segment') return url;
+            const params = {...target, kind, url};
             return this.proxyUrl(params);
         };
         let variant = false;
@@ -950,11 +1117,11 @@ export default class Yangshipin extends Spider {
         return JSON.stringify({date, epg_data: items});
     }
 
-    async resolve(pid, cnlid, refresh = false) {
+    async resolve(pid, cnlid, refresh = false, deadline = Date.now() + 25000) {
         if (!isChannelId(pid) || !isChannelId(cnlid)) throw new ProxyError(400, 'invalid channel id');
         const key = 'play:' + pid + ':' + cnlid;
         if (refresh) this.net.clearCache(key);
-        return this.net.cached(key, {ttl: 60000, stale: false}, () => this.resolvePlayer(pid, cnlid, Date.now() + 25000));
+        return this.net.cached(key, {ttl: 60000, stale: false}, () => this.resolvePlayer(pid, cnlid, deadline));
     }
 
     async resolvePlayer(pid, cnlid, deadline) {
@@ -1072,7 +1239,7 @@ export default class Yangshipin extends Spider {
         const locations = (data.backurl_list || []).map(item => item?.url).concat(data.playurl);
         const location = locations.find(isPlayUrl);
         if (!location) throw new ProxyError(502, '取得播放資訊: missing hls manifest');
-        return location;
+        return mediaUrl(location, data);
     }
 
     setPlayerCookies(session, guid) {
