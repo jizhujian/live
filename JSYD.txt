@@ -611,9 +611,6 @@ CETV1,http://ott.mobaibox.com/PLTV/4/224/3221227560/index.m3u8
 苏超-8738,http://ott.mobaibox.com/PLTV/4/224/3221228738/index.m3u8
 苏超-8750,http://ott.mobaibox.com/PLTV/4/224/3221228750/index.m3u8
 苏超-8803,http://ott.mobaibox.com/PLTV/4/224/3221228803/index.m3u8
-体育-9062,http://ott.mobaibox.com/PLTV/4/224/3221229062/index.m3u8
-体育-9109,http://ott.mobaibox.com/PLTV/4/224/3221229109/index.m3u8
-体育-9112,http://ott.mobaibox.com/PLTV/4/224/3221229112/index.m3u8
 
 NewTV,#genre#
 
@@ -659,7 +656,6 @@ CCTV8K,http://ott.mobaibox.com/PLTV/4/224/3221228165/index.m3u8
 浙江卫视4K,http://ott.mobaibox.com/PLTV/4/224/3221228916/index.m3u8
 浙江卫视4K,http://ali-xwl.cztv.com/live/channel4k2160p.m3u8
 北京卫视4K,http://ott.mobaibox.com/PLTV/4/224/3221228817/index.m3u8
-北京卫视4K,http://ott.mobaibox.com/PLTV/4/224/3221228890/index.m3u8
 东方卫视4K,http://ott.mobaibox.com/PLTV/4/224/3221228956/index.m3u8
 广东卫视4K,http://ott.mobaibox.com/PLTV/4/224/3221228838/index.m3u8
 深圳卫视4K,http://ott.mobaibox.com/PLTV/4/224/3221228835/index.m3u8

@@ -1161,12 +1161,6 @@ http://ott.mobaibox.com/PLTV/4/224/3221228738/index.m3u8
 http://ott.mobaibox.com/PLTV/4/224/3221228750/index.m3u8
 #EXTINF:-1 tvg-name="苏超-8803" tvg-logo="https://gitee.com/mytv-android/myTVlogo/raw/main/img/咪咕体育.png" group-title="体育",苏超-8803
 http://ott.mobaibox.com/PLTV/4/224/3221228803/index.m3u8
-#EXTINF:-1 tvg-name="体育-9062" tvg-logo="https://gitee.com/mytv-android/myTVlogo/raw/main/img/咪咕体育.png" group-title="体育",体育-9062
-http://ott.mobaibox.com/PLTV/4/224/3221229062/index.m3u8
-#EXTINF:-1 tvg-name="体育-9109" tvg-logo="https://gitee.com/mytv-android/myTVlogo/raw/main/img/咪咕体育.png" group-title="体育",体育-9109
-http://ott.mobaibox.com/PLTV/4/224/3221229109/index.m3u8
-#EXTINF:-1 tvg-name="体育-9112" tvg-logo="https://gitee.com/mytv-android/myTVlogo/raw/main/img/咪咕体育.png" group-title="体育",体育-9112
-http://ott.mobaibox.com/PLTV/4/224/3221229112/index.m3u8
 #EXTINF:-1 tvg-name="哒啵赛事" tvg-logo="https://gitee.com/mytv-android/myTVlogo/raw/main/img/哒啵赛事.png" group-title="NewTV",哒啵赛事
 http://ott.mobaibox.com/PLTV/4/224/3221225539/index.m3u8
 #EXTINF:-1 tvg-name="炫舞未来" tvg-logo="https://gitee.com/mytv-android/myTVlogo/raw/main/img/炫舞未来.png" group-title="NewTV",炫舞未来
@@ -1245,8 +1239,6 @@ http://ott.mobaibox.com/PLTV/4/224/3221228916/index.m3u8
 http://ali-xwl.cztv.com/live/channel4k2160p.m3u8
 #EXTINF:-1 tvg-name="北京卫视4K" tvg-logo="https://gitee.com/mytv-android/myTVlogo/raw/main/img/北京卫视4K.png" group-title="4K超高清",北京卫视4K
 http://ott.mobaibox.com/PLTV/4/224/3221228817/index.m3u8
-#EXTINF:-1 tvg-name="北京卫视4K" tvg-logo="https://gitee.com/mytv-android/myTVlogo/raw/main/img/北京卫视4K.png" group-title="4K超高清",北京卫视4K
-http://ott.mobaibox.com/PLTV/4/224/3221228890/index.m3u8
 #EXTINF:-1 tvg-name="东方卫视4K" tvg-logo="https://gitee.com/mytv-android/myTVlogo/raw/main/img/东方卫视4K.png" group-title="4K超高清",东方卫视4K
 http://ott.mobaibox.com/PLTV/4/224/3221228956/index.m3u8
 #EXTINF:-1 tvg-name="广东卫视4K" tvg-logo="https://gitee.com/mytv-android/myTVlogo/raw/main/img/广东卫视4K.png" group-title="4K超高清",广东卫视4K
