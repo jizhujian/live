@@ -4,7 +4,7 @@
   "manifest": {
     "id": "ysp-live",
     "name": "YSP Live v9.5",
-    "version": "2.0.13",
+    "version": "2.0.16",
     "apiVersion": 2,
     "externalXMLTV": [
       "https://epg.zsdc.eu.org/t.xml.gz",
@@ -139,6 +139,9 @@
   },
   "configurationSchema": [],
   "stateSchemaVersion": 1,
+  "lifecycle": {
+    "prewarm": true
+  },
   "requires": {
     "hostSDK": "2.2"
   }
@@ -152,7 +155,7 @@
  * 感谢 Gary's Club 提供原始脚本：https://t.me/garysclub
  * 本脚本仅供学习研究、功能验证与测试，请勿用于其他用途。
  *
- * NanoTV 宿主仅提供通用脚本运行环境与解析接口。
+ * NanoTV 仅提供通用脚本运行环境与解析接口。
  * YSP 相关认证流程与协议算法由本脚本实现或引用，
  * 频道信息、频道列表及播放地址来自第三方服务。
  *
@@ -168,14 +171,13 @@
  *
  * 一、脚本介绍（按出现顺序）
  *
- *   ① 服务入口    createYSPService      ← 紧接本导读；注册 nanoService，宿主只认这个对象
+ *   ① 服务入口    createYSPService      ← 紧接本导读；注册 nanoService
  *   ② BK 协议     createBKProtocol      BK 签名（cKey / TEA）与直播解析，兜底来源
- *   ③ Device 协议 createDeviceProtocol  电视投屏设备协议（设备身份、注册、心跳、VDN 签名）
+ *   ③ Device 协议 createDeviceProtocol  设备协议（设备身份、注册、心跳、VDN 签名）
  *   ④ JCE 协议    createJCEProtocol     JCE/QMF 二进制协议（直播窗口与回看）
  *   ⑤ 频道表      createChannelTable    频道数据、别名、回看频道、固定走 BK 的频道
  *
  *   ②～⑤ 是脚本内部模块，只给 ① 使用；宿主不会直接调用它们。
- *   整个文件包在一个私有作用域里，只有 nanoService 挂到全局。
  *
  * 二、两个方向的接口
  *
@@ -184,6 +186,7 @@
  *     channels()                返回频道列表（含是否支持回看）
  *     resolve(request, host)    播放或回看某频道：选来源 → 解析上游 → 开媒体会话
  *     mediaActivity(event)      播放器活动 / 关闭 / 需要重开的通知
+ *     prewarm(host)             预热：提前建立设备会话（App 进入前台 / 打开频道列表时，2.0.16 起）
  *     status()                  诊断状态（设备会话、冷却、最近失败）
  *     stop(host)                停止：保存身份，清空缓存
  *     testing                   仅供测试，宿主不调用
@@ -217,10 +220,6 @@
     /*
      * ① 服务入口 —— 宿主只通过 nanoService 调用脚本。
      *
-     * 本文件开头先注册 nanoService，并列出宿主会调用的方法各对应哪个函数；
-     * 往下依次是这些函数的实现、来源选择（Device / BK / JCE）、解析结果缓存与媒体会话登记。
-     * 各协议细节在后面的 createBKProtocol / createDeviceProtocol / createJCEProtocol 中，
-     * 频道数据在 createChannelTable 中。接口约定见 docs/SCRIPT-API-V2.md。
      */
 
     // 注册：组装内部模块，生成宿主调用的 nanoService。
@@ -261,7 +260,7 @@
             manifest: {
                 id: "ysp-live",
                 name: "YSP Live v9.5",
-                version: "2.0.13",
+                version: "2.0.16",
                 apiVersion: 2,
                 externalXMLTV: ["https://epg.zsdc.eu.org/t.xml.gz", "https://epg.pw/xmltv/epg_CN.xml.gz"],
                 networkHosts: HOSTS,
@@ -279,6 +278,7 @@
             channels: listChannels, //          频道列表
             resolve: resolvePlayback, //        播放 / 回看解析
             mediaActivity: onMediaActivity, //  播放器活动通知
+            prewarm: prewarmService, //         预热：提前建立设备会话（声明 lifecycle.prewarm）
             status: serviceStatus, //           诊断状态
             stop: stopService, //               停止时调用
             // 仅供测试（V2ProtocolTests、verify-ysp-window），宿主不调用。
@@ -307,6 +307,10 @@
             mediaCache.clear();
             mediaSources.clear();
             jceCooldown.clear();
+        }
+        // 宿主在 App 进入前台、打开本订阅的频道列表时调用；会话已在则立即返回。
+        function prewarmService() {
+            return device.prewarm();
         }
         function serviceStatus() {
             return device.status();
@@ -604,10 +608,6 @@
 
     /*
      * ② BK 协议 createBKProtocol() —— 脚本内部模块，只由服务入口调用，宿主不直接调用。
-     *
-     * BK 直播解析 resolveChannel()：生成 cKey 签名，请求 bkliveinfo，返回候选播放地址。
-     * BK 是兜底来源：Device / JCE 不可用时由服务入口回退到这里。
-     * 签名算法改编自 ysp-live-v9.5.py（BK 部分第 2218–2292 行）。
      */
     function createBKProtocol() {
         // ---- BK 协议常量 ----
@@ -1044,13 +1044,6 @@
     /*
      * ③ Device 协议 createDeviceProtocol() —— 脚本内部模块，只由服务入口调用，宿主不直接调用。
      *
-     * 模拟「央视频电视投屏助手」设备，取高码率直播地址（含 4K / 8K 频道）：
-     *   start()   载入或创建设备身份（host.storage 的 identity），注册 30 秒心跳
-     *   ensure()  按需建立设备会话：app/start 取会话密钥 → cloud/get 或 cloud/register 取 guid → 心跳确认；
-     *             会话 2 小时内复用，失败后冷却 30 秒
-     *   resolve() live/01 取视频列表 → live/02 取 appSecret → VDN 签名换最终地址
-     *   mediaActivity() 播放器仍在播时刷新链接活跃时间，让心跳继续
-     * 只有 LIVE_IDS 里的频道能走这条路。业务字段只放在脚本里，不进 Swift。
      */
     function createDeviceProtocol() {
         // ---- 协议常量、频道 Live ID、默认设备模板 ----
@@ -1314,7 +1307,8 @@
             cloudResponse = false,
             context = identity,
         ) {
-            const wait = 2000 - (host.now() - lastControl);
+            // 控制请求间隔 1 秒，与 ysp-live-v9.5.py 的 refresh_interval=1.0 一致（2.0.13 及以前为 2 秒）。
+            const wait = 1000 - (host.now() - lastControl);
             if (lastControl && wait > 0) await host.scheduler.sleep(wait);
             // app/start must create its fingerprint and timestamp after the pacing wait.
             const payload = typeof body === "function" ? body() : body;
@@ -1397,7 +1391,8 @@
         // ---- 会话建立与心跳 ----
         async function heartbeatCurrent() {
             const s = session;
-            if (!s || host.now() - lastAccess > 120000) return;
+            // 2.0.15 起只要有会话就发（原来 2 分钟无访问即停）：预热或空闲期内的会话没心跳可能失效。
+            if (!s) return;
             const v = await post(
                 "heartbeat",
                 "https://ytpdata.cctv.cn/das/app/data/message/single",
@@ -1598,6 +1593,50 @@
                 )
                 .join("&");
         }
+        const APP_SECRET_IDLE_MS = 300000;
+        function reusableAppSecret(s) {
+            return s.appSecret && host.now() - s.appSecretUsedAt < APP_SECRET_IDLE_MS ? s.appSecret : null;
+        }
+        async function appSecret(s) {
+            const cached = reusableAppSecret(s);
+            if (cached) return cached;
+            const two = await post(
+                "live/02",
+                BASE + "api/live/v1/02",
+                { guid: encrypt("", s.key) },
+                {},
+                false,
+                false,
+                false,
+                s.identity,
+            );
+            const secretValue =
+                typeof two.data === "string" ? two.data : two.data && (two.data.appSecret || two.data.app_secret);
+            if (typeof secretValue !== "string") throw fail("live/02", "Missing appSecret", resultCode(two));
+            s.appSecret = decrypt(secretValue, s.key);
+            s.appSecretUsedAt = host.now();
+            return s.appSecret;
+        }
+        async function vdnStream(s, raw, secret) {
+            const random = host.randomHex(4) + "-0000-" + host.randomHex(2) + "-0000-00000000" + host.randomHex(2);
+            const sign = host.crypto.digest("md5", AK + secret + random);
+            const vdn = await post(
+                "VDN",
+                "https://ytpvdn.cctv.cn/cctvmobileinf/rest/cctv/videoliveUrl/getstream",
+                form({
+                    appcommon: stable({ adid: "", av: "1.4.1", an: "央视频电视投屏助手", ap: "cctv_app_tv" }),
+                    url: raw,
+                }),
+                { APPID: AK, APPSIGN: sign, APPRANDOMSTR: random },
+                true,
+                false,
+                false,
+                s.identity,
+            );
+            if (String(vdn.succeed).replace(/"/g, "") !== "1" || typeof vdn.url !== "string" || !/^https?:\/\//.test(vdn.url))
+                throw fail("VDN", "VDN returned no final URL", resultCode(vdn));
+            return { vdn, sign, random };
+        }
         // ---- 直播解析（服务入口调用）----
         function resolve(channel, rate = "36p") {
             return transaction(() => resolveCurrent(channel, rate));
@@ -1648,41 +1687,19 @@
                     candidates.map((v) => safeRate(v.rate)).join(","),
                 );
                 const raw = /^https?:\/\//.test(video.url) ? video.url : decrypt(video.url, s.key);
-                const two = await post(
-                    "live/02",
-                    BASE + "api/live/v1/02",
-                    { guid: encrypt("", s.key) },
-                    {},
-                    false,
-                    false,
-                    false,
-                    s.identity,
-                );
-                const secretValue =
-                    typeof two.data === "string" ? two.data : two.data && (two.data.appSecret || two.data.app_secret);
-                if (typeof secretValue !== "string") throw fail("live/02", "Missing appSecret", resultCode(two));
-                const secret = decrypt(secretValue, s.key);
-                const random = host.randomHex(4) + "-0000-" + host.randomHex(2) + "-0000-00000000" + host.randomHex(2);
-                const sign = host.crypto.digest("md5", AK + secret + random);
-                const vdn = await post(
-                    "VDN",
-                    "https://ytpvdn.cctv.cn/cctvmobileinf/rest/cctv/videoliveUrl/getstream",
-                    form({
-                        appcommon: stable({ adid: "", av: "1.4.1", an: "央视频电视投屏助手", ap: "cctv_app_tv" }),
-                        url: raw,
-                    }),
-                    { APPID: AK, APPSIGN: sign, APPRANDOMSTR: random },
-                    true,
-                    false,
-                    false,
-                    s.identity,
-                );
-                if (
-                    String(vdn.succeed).replace(/"/g, "") !== "1" ||
-                    typeof vdn.url !== "string" ||
-                    !/^https?:\/\//.test(vdn.url)
-                )
-                    throw fail("VDN", "VDN returned no final URL", resultCode(vdn));
+                // VDN 签名。
+                let signed;
+                const reused = !!reusableAppSecret(s);
+                try {
+                    signed = await vdnStream(s, raw, await appSecret(s));
+                } catch (e) {
+                    if (!reused) throw e;
+                    host.log("DEVICE appSecret reuse rejected stage=" + (e.stage || "VDN") + "; refreshing live/02");
+                    s.appSecret = null;
+                    signed = await vdnStream(s, raw, await appSecret(s));
+                }
+                s.appSecretUsedAt = host.now();
+                const { vdn, sign, random } = signed;
                 links.set(channel.id, host.now());
                 return {
                     url: vdn.url,
@@ -1743,9 +1760,17 @@
             }
             h.scheduler.every("ysp-heartbeat", 30000, heartbeat);
         }
+        // 预热：排进同一事务队列，播放请求随后到来时直接复用（或等待）这次建立的会话。
+        function prewarm() {
+            return transaction(async () => {
+                lastAccess = host.now();
+                await ensure();
+            });
+        }
         // ---- 导出给服务入口 ----
         return {
             start,
+            prewarm,
             resolve,
             mediaActivity,
             liveIDs: LIVE_IDS,
@@ -1781,11 +1806,6 @@
 
     /*
      * ④ JCE 协议 createJCEProtocol() —— 脚本内部模块，只由服务入口调用，宿主不直接调用。
-     *
-     * 用 JCE/QMF 二进制协议向 jacc.ysp.cctv.cn 请求某频道某时间段的播放地址，
-     * 服务入口用它做两件事：回看（过去的时间窗）和直播窗口（覆盖到未来 15 分钟）。
-     * 请求全局串行，相邻两次间隔约 0.7 秒。这里只处理控制报文，视频数据由宿主（Swift）处理。
-     * start() 载入或生成 jce-guid 并保存在 host.storage。
      */
     function createJCEProtocol() {
         let host,
@@ -2062,11 +2082,6 @@
     /*
      * ⑤ 频道表 createChannelTable() —— 纯数据，Device / BK / JCE 和服务入口共用。
      *
-     * 一个频道走哪个来源，看三处：
-     *   - CATCHUP_IDS（本文件）     支持回看与 JCE 直播窗口
-     *   - FORCE_BK_IDS（本文件）    auto 模式下固定走 BK
-     *   - LIVE_IDS（device.js）     有 Device ID，auto 模式下优先走 Device
-     * 选择规则见文件开头导读第三节。
      */
     function createChannelTable() {
         // ---- 频道：id、名称、分组、台标、清晰度；channelID / livePID 是 BK 与 JCE 请求用的上游编号 ----
