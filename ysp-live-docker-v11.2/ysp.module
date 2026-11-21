@@ -1,8 +1,8 @@
 #!name=央视频直连分流
-#!desc=解决央视频4K/8K直播及高码率因走代理导致403的问题
+#!desc=将匹配的央视频直播、回看及本地网关连接设为直连
 #!author=Gary's Club
 #!homepage=https://t.me/garysclub
-#!date=2026-10-17
+#!date=2026-11-19
 
 [Rule]
 DOMAIN-SUFFIX,cctv.cn,DIRECT
