@@ -34,7 +34,7 @@ import urllib .request
 import uuid 
 # Keep localhost traffic on the device. External requests use the runtime's network settings.
 loopback_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-__version__ ='11.2'
+__version__ ='11.3'
 AUTHOR_COMMUNITY ='https://t.me/garysclub'
 AUTHOR_CHANNEL ='https://t.me/garysclubchannel'
 AUTHOR_NOTICE =f'''📢 首发地址
@@ -235,6 +235,21 @@ def rsa_oaep_sha256_encrypt (der :bytes ,message :bytes ,seed :bytes )->bytes :
     return c .to_bytes (k ,'big')
 class YsptpError (Exception ):
     pass 
+
+class PlaylistHTTPError(YsptpError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f'upstream m3u8 HTTP {status}')
+
+
+def channel_cooldown_remaining(failure, now):
+    if not failure:
+        return 0.0
+    failed_at, _, count = failure
+    delay = 15 if count <= 1 else 60 if count == 2 else 120
+    return max(0.0, failed_at + delay - now)
+
+
 def now_f64 ()->float :
     return time .time ()
 def current_time_ms ()->int :
@@ -392,6 +407,9 @@ class ChannelEntry :
         return bool (self .final_url )and now <self .expires_at 
     def stale_usable (self ,now :float ,ttl :float )->bool :
         return bool (self .final_url )and ttl >0.0 and (now <self .expires_at +ttl )
+    def belongs_to_session(self, session):
+        return (session is not None and self.session_generation == session.generation
+                and self.refreshed_at >= session.created_at)
     @classmethod 
     def from_dict (cls ,d :dict )->'ChannelEntry':
         kwargs ={}
@@ -411,6 +429,7 @@ class PlaylistCacheEntry :
     android_id :str =''
     proxy_origin :str =''
     proxy_prefix :str =''
+    live_digest: bytes = b''
 @dataclasses .dataclass 
 class PlaylistCacheProbe :
     state :str =''
@@ -1105,18 +1124,7 @@ class Resolver :
         with self .state_lock :
             self .state .identity_reset_error_count =0 
     def is_channel_in_cooldown (self ,channel :str )->bool :
-        with self .state_lock :
-            fail =self .state .channel_failures .get (channel )
-            if fail is None :
-                return False 
-            failed_at ,_ ,fail_count =fail 
-            if fail_count <=1 :
-                cooldown =15.0 
-            elif fail_count ==2 :
-                cooldown =60.0 
-            else :
-                cooldown =120.0 
-            return (now_f64 ()-failed_at )<cooldown 
+        return channel_cooldown_remaining(self.get_channel_failure_info(channel), now_f64()) > 0
     def get_channel_failure_info (self ,channel :str ):
         with self .state_lock :
             return self .state .channel_failures .get (channel )
@@ -1146,18 +1154,6 @@ class Resolver :
                                     e2 .last_refresh_error =reason 
                                     e2 .last_refresh_failed_at =now 
                         return clone 
-                fail =self .state .channel_failures .get (channel )
-                if fail is not None :
-                    failed_at ,err_msg ,fail_count =fail 
-                    if fail_count <=1 :
-                        cooldown =15.0 
-                    elif fail_count ==2 :
-                        cooldown =60.0 
-                    else :
-                        cooldown =120.0 
-                    elapsed =now -failed_at 
-                    if elapsed <cooldown :
-                        raise YsptpError (f'channel {channel } in cooldown ({int (elapsed )}s/{int (cooldown )}s): {err_msg }')
         with self .control_lock :
             now =now_f64 ()
             if not force :
@@ -1165,8 +1161,11 @@ class Resolver :
                     entry =self .state .cache .get (channel )
                     if entry is not None and entry .fresh (now )and (not entry_missing_signed_playback_headers (entry )):
                         return entry 
+                    failure = self.state.channel_failures.get(channel)
+                    if channel_cooldown_remaining(failure, now) > 0:
+                        raise YsptpError(f'频道 {channel} 冷却中（{failure[1]}）')
             try :
-                entry =self .refresh_channel_controlled (channel )
+                entry = self.refresh_channel_controlled(channel, reuse_on_return=not force)
             except YsptpError as err :
                 err_text =str (err )
                 with self .state_lock :
@@ -1244,16 +1243,11 @@ class Resolver :
         with self .state_lock :
             self .state .background_refreshing .pop (channel ,None )
         return ok 
-    def refresh_channel_controlled (self ,channel :str )->ChannelEntry :
+    def refresh_channel_controlled(self, channel: str, *, reuse_on_return=False) -> ChannelEntry:
         with self .state_lock :
             wait =float (self .args .refresh_interval )-(now_f64 ()-self .state .last_business_end_at )
         if wait >0.0 :
             time .sleep (wait )
-        with self .state_lock :
-            self .state .refreshing_channel =channel 
-            self .state .generation +=1 
-            generation =self .state .generation 
-        log (f'[{channel }] 正在向央视频协议引擎请求直播源…',min_interval =10.0 )
         try :
             slot =self .get_slot_for_channel (channel )
             limit =int (getattr (self .args ,'links_per_device',6 ))
@@ -1265,6 +1259,21 @@ class Resolver :
             live_id =channel_by_name (channel )
             if live_id is None :
                 raise YsptpError (f'unknown channel {channel }')
+            with self.state_lock:
+                entry = self.state.cache.get(channel)
+                cached = self.state.playlist_cache.get(channel)
+                if (reuse_on_return and entry and cached and cached.live_digest
+                        and cached.final_url == entry.final_url and cached.android_id == entry.android_id
+                        and self.args.cache_ttl <= now_f64() - cached.cached_at < DEVICE_RETURN_WINDOW
+                        and entry.belongs_to_session(app_session)
+                        and not entry_missing_signed_playback_headers(entry)):
+                    app_session.linked_channels.add(channel)
+                    log(f'[{channel}] 切回频道，使用上次的地址读取当前播放列表', min_interval=10)
+                    return entry
+                self.state.refreshing_channel = channel
+                self.state.generation += 1
+                generation = self.state.generation
+            log(f'[{channel}] 正在向央视频协议引擎请求直播源…', min_interval=10)
             entry =self .resolve_channel_once (app_session ,channel ,live_id ,generation )
             app_session .linked_channels .add (channel )
         except YsptpError as err :
@@ -1573,6 +1582,8 @@ class Resolver :
                 url =value .get ('url')
                 if isinstance (url ,str ):
                     return VdnGetStreamResult (final_url =url ,app_sign =app_sign ,app_random_str =random_str )
+            if str(value.get('error_code')) == '3' and value.get('error_desc') == '内部错误':
+                raise YsptpError('VDN 返回内部错误（错误码 3），未提供播放地址')
         raise YsptpError (f'VDN did not return final URL: {text [:400 ]}')
     def send_heartbeat (self )->None :
         if not self .control_lock .acquire (blocking =False ):
@@ -1659,79 +1670,85 @@ class Resolver :
             raise YsptpError (f'missing cached signed playback headers for {host }')
         uid =current_cctv_android_id (self )
         return default_cctv_playback_headers (uid )
-    def fetch_playlist (self ,entry :ChannelEntry ,proxy_origin :str ,proxy_prefix =None ):
-        now =now_f64 ()
-        with self .state_lock :
-            probe =inspect_playlist_cache (self .state .playlist_cache .get (entry .channel ),entry ,proxy_origin ,proxy_prefix ,now )
-            if probe .state =='hit':
-                cached =self .state .playlist_cache [entry .channel ]
-                return (cached .body ,cached .content_type ,probe )
-        with self .playlist_locks_lock :
-            lock =self .playlist_locks .get (entry .channel )
-            if lock is None :
-                lock =threading .Lock ()
-                self .playlist_locks [entry .channel ]=lock 
-        with lock :
-            now =now_f64 ()
-            with self .state_lock :
-                probe =inspect_playlist_cache (self .state .playlist_cache .get (entry .channel ),entry ,proxy_origin ,proxy_prefix ,now )
-                if probe .state =='hit':
-                    cached =self .state .playlist_cache [entry .channel ]
-                    return (cached .body ,cached .content_type ,probe )
-                miss_probe =probe 
-            playback_headers =cctv_playback_headers_for_entry (entry )
-            try :
-                status ,content_type ,text =fetch_playlist_http1 (entry .final_url ,playback_headers )
-            except YsptpError as err :
-                self .record_recoverable_error (str (err ))
-                with self .state_lock :
-                    cached =self .state .playlist_cache .get (entry .channel )
-                if cached and (now_f64 ()-cached .cached_at <20.0 ):
-                    return (cached .body ,cached .content_type ,miss_probe )
-                raise 
-            if not 200 <=status <300 :
-                err =YsptpError (f'upstream m3u8 HTTP {status }: {text [:300 ]}')
-                self .record_recoverable_error (str (err ))
-                with self .state_lock :
-                    cached =self .state .playlist_cache .get (entry .channel )
-                if cached and (now_f64 ()-cached .cached_at <20.0 ):
-                    return (cached .body ,cached .content_type ,miss_probe )
-                raise err 
-            self .clear_recoverable_error_count ()
-            body =rewrite_playlist_urls (text ,entry .final_url )
-            body =self .proxy_playlist_ts_urls (body ,proxy_origin ,proxy_prefix )
-            if float (self .args .playlist_cache_ttl )>0.0 :
-                now =now_f64 ()
-                cached =PlaylistCacheEntry (body =body ,content_type =content_type ,cached_at =now ,expires_at =now +float (self .args .playlist_cache_ttl ),final_url =entry .final_url ,android_id =entry .android_id ,proxy_origin =proxy_origin ,proxy_prefix =proxy_prefix or '')
-                with self .state_lock :
-                    self .state .playlist_cache [entry .channel ]=cached 
-            return (body ,content_type ,miss_probe )
+    def fetch_playlist(self, entry, proxy_origin, proxy_prefix=None):
+        with self.state_lock:
+            cached = self.state.playlist_cache.get(entry.channel)
+        now = now_f64()
+        probe = inspect_playlist_cache(cached, entry, proxy_origin, proxy_prefix, now)
+        if probe.state == 'hit':
+            return cached.body, cached.content_type, probe
+
+        playback_headers = cctv_playback_headers_for_entry(entry)
+        try:
+            status, content_type, text = fetch_playlist_http1(entry.final_url, playback_headers)
+            if not 200 <= status < 300:
+                raise PlaylistHTTPError(status)
+        except YsptpError as exc:
+            self.record_recoverable_error(str(exc))
+            transient = not isinstance(exc, PlaylistHTTPError) or 500 <= exc.status < 600
+            if transient and probe.state == 'miss:expired' and now_f64() - cached.cached_at < 20:
+                return cached.body, cached.content_type, probe
+            raise
+        if text.lstrip().partition('\n')[0].rstrip() != '#EXTM3U' or not any(
+            line.strip() and not line.lstrip().startswith('#') for line in text.splitlines()
+        ):
+            raise YsptpError('上游未返回有效播放列表')
+
+        self.clear_recoverable_error_count()
+        body = self.proxy_playlist_ts_urls(rewrite_playlist_urls(text, entry.final_url), proxy_origin, proxy_prefix)
+        live_digest = hashlib.sha256(text.encode()).digest() if '#EXTINF:' in text and '#EXT-X-ENDLIST' not in text else b''
+        now = now_f64()
+        with self.state_lock:
+            if self.state.cache.get(entry.channel) is entry:
+                session = self.state.app_session
+                if (entry.belongs_to_session(session) and entry.channel in session.linked_channels
+                        and live_digest and (not cached or cached.live_digest != live_digest)):
+                    expires = now + self.args.cache_ttl
+                    if self.args.session_ttl > 0:
+                        expires = min(expires, session.created_at + self.args.session_ttl)
+                    entry.expires_at = expires
+                if self.args.playlist_cache_ttl > 0:
+                    self.state.playlist_cache[entry.channel] = PlaylistCacheEntry(
+                        body=body, content_type=content_type, cached_at=now,
+                        expires_at=now + self.args.playlist_cache_ttl, final_url=entry.final_url,
+                        android_id=entry.android_id, proxy_origin=proxy_origin, proxy_prefix=proxy_prefix or '',
+                        live_digest=live_digest)
+        return body, content_type, probe
+
     def fetch_channel_playlist(self, channel, host_header, proto='http', *, defer=True):
-        with self .state_lock :
-            self .state .channel_last_access [channel ]=now_f64 ()
-        if defer and self.zap_debounced(channel):
-            log (f'[{channel }] 换台防抖: 先出 1080p, 停留后自动升码率',min_interval =10.0 )
-            return None 
-        host =host_header .strip ()if host_header else f'localhost:{server_port }'
-        scheme =proto if proto in ('http','https')else 'http'
-        proxy_origin =f'{scheme }://{host }'
-        entry =self .ensure_channel (channel )
-        for attempt in range (2 ):
-            try :
-                body ,_content_type ,_probe =self .fetch_playlist (entry ,proxy_origin )
-                self .clear_channel_cooldown (channel )
-                return body 
-            except YsptpError as e :
-                err_str =str (e )
-                is_expiry ='HTTP 403'in err_str or 'HTTP 404'in err_str or 'HTTP 401'in err_str or 'upstream m3u8'in err_str 
-                if is_expiry and attempt ==0 :
-                    log (f'[{channel }] 高码率播放地址已过期，正在极速重取新地址…',min_interval =4.0 )
-                    with self .state_lock :
-                        self .state .cache .pop (channel ,None )
-                        self .state .playlist_cache .pop (channel ,None )
-                    entry =self .ensure_channel (channel ,force =True )
-                    continue 
-                raise 
+        with self.state_lock:
+            self.state.channel_last_access[channel] = now_f64()
+        host = host_header.strip() if host_header else f'localhost:{server_port}'
+        scheme = proto if proto in ('http', 'https') else 'http'
+        with self.playlist_locks_lock:
+            lock = self.playlist_locks.get(channel)
+            if lock is None:
+                lock = self.playlist_locks[channel] = threading.Lock()
+        with lock:
+            if self.is_channel_in_cooldown(channel):
+                return None
+            if defer and self.zap_debounced(channel):
+                log(f'[{channel}] 换台防抖: 先出 1080p, 停留后自动升码率', min_interval=10)
+                return None
+            for attempt in range(2):
+                entry = self.ensure_channel(channel)
+                try:
+                    body, _, _ = self.fetch_playlist(entry, f'{scheme}://{host}')
+                except (YsptpError, OSError, http.client.HTTPException) as exc:
+                    invalid = isinstance(exc, PlaylistHTTPError) and exc.status in (401, 403, 404, 410)
+                    with self.state_lock:
+                        if invalid and self.state.cache.get(channel) is entry:
+                            self.state.cache.pop(channel)
+                            self.state.playlist_cache.pop(channel, None)
+                        if not invalid or attempt:
+                            previous = self.state.channel_failures.get(channel)
+                            self.state.channel_failures[channel] = (now_f64(), str(exc), previous[2] + 1 if previous else 1)
+                            raise
+                    log(f'[{channel}] 播放列表返回 HTTP {exc.status}，重新获取播放地址', min_interval=4)
+                    continue
+                self.clear_channel_cooldown(channel)
+                return body
+
     def status_json (self )->dict :
         with self .state_lock :
             state_snapshot ={'refreshing_channel':self .state .refreshing_channel ,'last_business_end_at':self .state .last_business_end_at ,'last_error':self .state .last_error ,'identity_reset_error_count':self .state .identity_reset_error_count ,'identity_reset_count':self .state .identity_reset_count ,'last_identity_reset_at':self .state .last_identity_reset_at ,'last_identity_reset_reason':self .state .last_identity_reset_reason ,'ad_display':self .state .ad_display ,'generation':self .state .generation ,'session_generation':self .state .session_generation ,'cache':dict (self .state .cache ),'playlist_cache':dict (self .state .playlist_cache ),'background_refreshing':dict (self .state .background_refreshing ),'app_session':self .state .app_session }
@@ -2377,6 +2394,7 @@ UA ='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, 
 REFRESH_INTERVAL =10 
 IDLE_TIMEOUT =120 
 LINK_IDLE_TIMEOUT =15.0 
+DEVICE_RETURN_WINDOW = 300
 BK_URL_TTL =300 
 BACKEND_CHANNELS ={
 'cctv1','cctv2','cctv3','cctv4','cctv5','cctv5p','cctv7','cctv8',
@@ -2444,7 +2462,7 @@ class TsSegmentCache :
                 return None 
             self .hits +=1 
             return data ,headers 
-    def set (self ,key :str ,data :bytes ,headers :dict ):
+    def set(self, key: str, data: bytes, headers: dict, *, ttl=None):
         with self .lock :
             if len (data )>self .max_bytes :
                 return 
@@ -2461,7 +2479,7 @@ class TsSegmentCache :
                 old_val =self .cache .pop (old_key ,None )
                 if old_val :
                     self .curr_bytes -=len (old_val [0 ])
-            self .cache [key ]=(data ,headers ,now +self .max_age )
+            self.cache[key] = (data, headers, now + (self.max_age if ttl is None else min(ttl, self.max_age)))
             self .order .append (key )
             self .curr_bytes +=len (data )
     def stats (self )->dict :
@@ -2474,6 +2492,70 @@ class TsSegmentCache :
             'misses':self .misses ,
             'hit_rate':f"{round (self .hits /total *100 ,1 )}%"
             }
+def cached_segment_span(value, size):
+    if value is None:
+        return 0, size
+    match = re.fullmatch(r'bytes=([0-9]*)-([0-9]*)', value.strip(), re.IGNORECASE)
+    if not match or not any(match.groups()):
+        return None
+    first, last = match.groups()
+    try:
+        if not first:
+            return max(0, size - int(last)), size
+        start = int(first)
+        end = int(last) + 1 if last else size
+    except ValueError:
+        return None
+    return start, min(end, size)
+
+
+def segment_play_time(token):
+    if resolver is None:
+        return None
+    with resolver.state_lock:
+        playlists = list(resolver.state.playlist_cache.items())
+    for slug, playlist in playlists:
+        suffix = ('/proxy?ts=' if playlist.proxy_prefix else '/proxy.ts?=') + token
+        if suffix + '\n' not in playlist.body:
+            continue
+        duration = 0.0
+        for line in playlist.body.splitlines():
+            if line.startswith('#EXTINF:'):
+                try:
+                    duration = float(line.partition(':')[2].partition(',')[0])
+                except ValueError:
+                    duration = 0.0
+            elif line.startswith('#EXT-X-BYTERANGE:'):
+                duration = 0.0
+            elif line and not line.startswith('#'):
+                if line.endswith(suffix) and math.isfinite(duration) and duration > 0 and slug in CHANNEL_MAP:
+                    return CHANNEL_MAP[slug], duration
+                duration = 0.0
+    return None
+
+
+def segment_extent(status, headers):
+    raw = headers.get('Content-Length', '')
+    length = int(raw) if raw.isascii() and raw.isdecimal() else None
+    content_range = headers.get('Content-Range', '')
+    if status == 206:
+        match = re.fullmatch(r'bytes 0-([0-9]+)/([0-9]+)', content_range, re.IGNORECASE)
+        if match:
+            total = int(match[2])
+            if int(match[1]) + 1 == total and length in (None, total):
+                return True, total
+    return status == 200 and not content_range, length
+
+
+def segment_cache_ttl(policy, age, limit):
+    if re.search(r'\b(?:no-store|no-cache|private)\b', policy, re.I):
+        return 0
+    ages = re.findall(r'(?:^|,)\s*(?:s-maxage|max-age)\s*=\s*"?(\d+)', policy, re.I)
+    elapsed = int(age) if age.isascii() and age.isdecimal() else 0
+    return max(0, min([limit] + [int(value) - elapsed for value in ages]))
+
+
+last_segment_fetch = None
 global_ts_cache =TsSegmentCache (max_mb =200 )
 class ChannelDirectory :
     def __init__ (self ):
@@ -2573,6 +2655,7 @@ class Channel :
         self .bk_playlist =''
         self.bk_playlist_source = 'bk'
         self.engine_probe_until = 0.0
+        self.prefer_regular_until = 0.0
         self.engine_decodable = False
         self.rights_blocked_until = 0.0
         self.first_refresh = threading.Event()
@@ -2581,6 +2664,16 @@ class Channel :
         self.upstream_status = None
         self .last_built_playlist =''
         self .last_built_time =0.0 
+
+    def prefer_regular_after_slow_segment(self, duration, read_seconds):
+        with self.lock:
+            now = time.monotonic()
+            if self.prefer_regular_until > now:
+                return
+            self.prefer_regular_until = now + 120
+        log(f'[{self.slug}] {duration:g} 秒分片回源已耗时 {read_seconds:.1f} 秒，接下来 2 分钟优先普通线路')
+        start_channel_worker(self)
+
 def defn_label (defn ):
     d =(defn or '').strip ().lower ()
     if d =='fhd':
@@ -2985,6 +3078,131 @@ def replay_window(query, now):
 
 
 class Handler (BaseHTTPRequestHandler ):
+    def serve_cached_segment(self, cached, range_header, head_only):
+        data, headers = cached
+        span = cached_segment_span(range_header, len(data))
+        if span is None:
+            return False
+        start, end = span
+        status = 206 if range_header else 200
+        if range_header and start >= end:
+            status = 416
+        self.send_response(status)
+        if range_header:
+            extent = '*' if status == 416 else f'{start}-{end - 1}'
+            self.send_header('Content-Range', f'bytes {extent}/{len(data)}')
+        self.send_header('Content-Type', headers.get('Content-Type', 'video/mp2t'))
+        self.send_header('Content-Length', str(max(0, end - start)))
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Cache-Control', 'no-cache' if status != 416 else 'no-store')
+        for field in ('ETag', 'Last-Modified'):
+            if field in headers:
+                self.send_header(field, headers[field])
+        self.send_header('X-Cache', 'HIT-RAM')
+        self.end_headers()
+        if not head_only and end > start:
+            self.wfile.write(memoryview(data)[start:end])
+        return True
+
+    def serve_device_segment(self, real_url, token, head_only):
+        global last_segment_fetch
+        range_header = self.headers.get('Range')
+        if_range = self.headers.get('If-Range') if range_header else None
+        if not if_range:
+            cached = global_ts_cache.get(real_url)
+            if cached:
+                try:
+                    if self.serve_cached_segment(cached, range_header, head_only):
+                        return
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+        try:
+            playback = resolver.playback_headers_for_ts_url(real_url) if resolver else {}
+        except YsptpError as exc:
+            self._send(500, str(exc), head_only=head_only)
+            return
+        extra = {'Range': header_value_clean(range_header)} if range_header else {}
+        if if_range:
+            extra['If-Range'] = header_value_clean(if_range)
+        started = time.monotonic()
+        first_byte_ms = None
+        sent = 0
+        read_seconds = 0.0
+        slug = None
+        status = None
+        outcome = '中断'
+        headers_sent = False
+        try:
+            with open_media(real_url, _playback_request_headers(playback, extra),
+                            method='HEAD' if head_only else 'GET', timeout=30) as response:
+                status = response.status
+                whole, length = segment_extent(status, response.headers)
+                policy = response.headers.get('Cache-Control', 'public, max-age=300') if status in (200, 206) else 'no-store'
+                self.send_response(status)
+                for field in ('Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges', 'Location',
+                              'Content-Encoding', 'ETag', 'Last-Modified'):
+                    if field in response.headers:
+                        self.send_header(field, response.headers[field])
+                self.send_header('X-Cache', 'MISS-UPSTREAM')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Cache-Control', policy)
+                self.end_headers()
+                headers_sent = True
+                if head_only:
+                    return
+                limit = min(35 * 1024 * 1024, global_ts_cache.max_bytes)
+                buffer = None
+                ttl = segment_cache_ttl(policy, response.headers.get('Age', '0'), global_ts_cache.max_age)
+                if (whole and (length is None or length <= limit)
+                        and ttl and response.headers.get('Content-Encoding', 'identity').lower() == 'identity'):
+                    buffer = bytearray()
+                monitor = whole and (not range_header or range_header.lower() == 'bytes=0-' or
+                                     (length and cached_segment_span(range_header, length) == (0, length)))
+                timing = segment_play_time(token) if monitor else None
+                if timing:
+                    slug = timing[0].slug
+                while True:
+                    before = time.monotonic()
+                    chunk = response.read1(65536)
+                    if not chunk:
+                        break
+                    if first_byte_ms is None:
+                        first_byte_ms = round((time.monotonic() - started) * 1000)
+                    else:
+                        read_seconds += time.monotonic() - before
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+                    if timing and sent >= 65536 and read_seconds >= max(4.0, 1.5 * timing[1]):
+                        timing[0].prefer_regular_after_slow_segment(timing[1], read_seconds)
+                        timing = None
+                    if buffer is not None:
+                        if sent <= limit:
+                            buffer.extend(chunk)
+                        else:
+                            buffer = None
+                if length is not None and sent != length:
+                    self.close_connection = True
+                    outcome = '分片截断'
+                    return
+                outcome = '完成' if status in (200, 206) else '上游 HTTP 错误'
+                if buffer:
+                    fields = {k: response.headers[k] for k in ('Content-Type', 'ETag', 'Last-Modified') if k in response.headers}
+                    global_ts_cache.set(real_url, bytes(buffer), fields, ttl=ttl)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except (OSError, http.client.HTTPException, ValueError, YsptpError):
+            if headers_sent:
+                self.close_connection = True
+            else:
+                self._send(502, '分片下载失败', head_only=head_only)
+        finally:
+            if not head_only:
+                last_segment_fetch = dict(at=int(time.time()), status=status, channel=slug, ranged=bool(range_header),
+                                          bytes_sent=sent, first_byte_ms=first_byte_ms,
+                                          read_ms=round(read_seconds * 1000),
+                                          elapsed_ms=round((time.monotonic() - started) * 1000), outcome=outcome)
+
     def serve_replay_segment(self, slug, target, head_only):
         headers = {'Range': self.headers['Range']} if self.headers.get('Range') else {}
         sent_headers = False
@@ -3076,21 +3294,15 @@ class Handler (BaseHTTPRequestHandler ):
                    extra_headers={'X-YSP-Source': 'catchup'})
 
     def serve_device_playlist(self, ch, proto, head_only, *, defer):
-        if ch.slug not in active_backend_channels or not resolver_ready() or resolver is None:
+        if defer and time.monotonic() < ch.prefer_regular_until:
             return False
-        if resolver.is_channel_in_cooldown(ch.slug):
+        if ch.slug not in active_backend_channels or not resolver_ready() or resolver is None:
             return False
         try:
             host = self.headers.get('Host', f'localhost:{server_port}')
             playlist = resolver.fetch_channel_playlist(ch.slug, host, proto, defer=defer)
         except Exception as exc:
-            with resolver.state_lock:
-                resolver.state.cache.pop(ch.slug, None)
-                resolver.state.playlist_cache.pop(ch.slug, None)
-                previous = resolver.state.channel_failures.get(ch.slug)
-                failures = previous[2] + 1 if previous else 1
-                resolver.state.channel_failures[ch.slug] = (now_f64(), str(exc), failures)
-            log(f'[{ch.slug}] 高码率播放暂时受限 ({exc})，回退普通直播', min_interval=5)
+            log(f'[{ch.slug}] 高码率直播暂不可用（{exc}），尝试备用线路', min_interval=5)
             return False
         if not playlist or '#EXTM3U' not in playlist:
             return False
@@ -3098,7 +3310,7 @@ class Handler (BaseHTTPRequestHandler ):
                    head_only=head_only, extra_headers={'X-YSP-Source': 'device'})
         return True
 
-    server_version ='ysp-live/11.2'
+    server_version ='ysp-live/11.3'
     def log_message (self ,fmt ,*args ):
         pass 
     def _send (self ,code ,body ,ctype ='text/plain; charset=utf-8',head_only =False ,extra_headers =None ):
@@ -3149,7 +3361,7 @@ class Handler (BaseHTTPRequestHandler ):
             active_slots =len ([s for s in (resolver .state .sessions .values ()if resolver else [])if s and resolver .app_session_fresh (s )])
             health_data ={
             "ok":True ,
-            "version":"11.2",
+            "version":"11.3",
             "author_community":AUTHOR_COMMUNITY ,
             "author_channel":AUTHOR_CHANNEL ,
             "notice":"其他渠道均非作者发布！",
@@ -3163,6 +3375,7 @@ class Handler (BaseHTTPRequestHandler ):
             },
             "channels":len (global_channel_dir .unique_channels ()),
             "ts_cache":cache_info ,
+            "last_segment_fetch": last_segment_fetch,
             "routes":["/","/all.m3u","/diag","/health","/<channel>.m3u8","/proxy.ts"]
             }
             self ._send (200 ,json .dumps (health_data ,ensure_ascii =False ,indent =2 ),'application/json; charset=utf-8',head_only =head_only )
@@ -3201,7 +3414,7 @@ class Handler (BaseHTTPRequestHandler ):
             info =[]
             now =time .time ()
             info .append ("====================================================")
-            info .append (f"ysp-live v11.2 诊断报告 (运行时间: {int (now -server_start_time )}s)")
+            info .append (f"ysp-live v11.3 诊断报告 (运行时间: {int (now -server_start_time )}s)")
             info .append ("📢 首发地址")
             info .append (f"社区：Gary's Club ({AUTHOR_COMMUNITY})")
             info .append (f"频道：Gary's Club Channel ({AUTHOR_CHANNEL})")
@@ -3219,18 +3432,26 @@ class Handler (BaseHTTPRequestHandler ):
                 info .append (f'Slot 0 心跳日志: {s0 .last_heartbeat_error }')
             c_stats =global_ts_cache .stats ()
             info .append (f"分片内存缓存: 条目={c_stats ['count']}, 占用={c_stats ['size_mb']}MB, 命中率={c_stats ['hit_rate']} (命中:{c_stats ['hits']}/未中:{c_stats ['misses']})")
+            transfer = last_segment_fetch
+            if transfer:
+                first = transfer['first_byte_ms']
+                info.append(f"最近一次设备分片回源（{transfer['channel'] or '频道未知'}，{int(now) - transfer['at']} 秒前）: "
+                            f"HTTP {transfer['status']}，Range={transfer['ranged']}，"
+                            f"首字节 {first if first is not None else '—'} ms，随后等上游数据 {transfer['read_ms']} ms，总耗时 {transfer['elapsed_ms']} ms，"
+                            f"已发送 {transfer['bytes_sent']} 字节，{transfer['outcome']}")
             info .append ('--- 频道状态列表 ---')
             for ch_meta in global_channel_dir .unique_channels ():
                 slug =ch_meta ['slug']
                 ch =CHANNEL_MAP .get (slug )
                 age ='%ds前'%int (now -ch .last_ok )if ch and ch .last_ok else '从未拉取'
                 mode_str ='4K/高码率'if slug in active_backend_channels and resolver_ready ()else (ch.bk_playlist_source if ch and ch.last_ok else 'idle')
+                if ch and ch.prefer_regular_until > time.monotonic():
+                    mode_str = f'优先普通线路（高码率分片慢，剩余 {math.ceil(ch.prefer_regular_until - time.monotonic())} 秒）'
                 cooldown_str =''
                 if resolver and resolver .is_channel_in_cooldown (slug ):
                     fail_info =resolver .get_channel_failure_info (slug )
                     if fail_info :
-                        cd =15.0 if fail_info [2 ]<=1 else (60.0 if fail_info [2 ]==2 else 120.0 )
-                        rem_sec =max (0 ,int (cd -(now -fail_info [0 ])))
+                        rem_sec = int(channel_cooldown_remaining(fail_info, now))
                         cooldown_str =f' [高码冷却剩{rem_sec }s]'
                 err_msg =ch .last_error if ch else '无'
                 info .append (f"{slug } ({ch_meta ['name']}) 模式={mode_str }{cooldown_str } 上次刷新={age } 错误={err_msg or '无'}")
@@ -3250,78 +3471,8 @@ class Handler (BaseHTTPRequestHandler ):
             except YsptpError as err :
                 self ._send (400 ,f'{err }\n',head_only =head_only )
                 return 
-            range_header =self .headers .get ('Range')
-            cached_item =global_ts_cache .get (real_url )if not range_header else None 
-            if cached_item is not None :
-                cached_bytes ,cached_headers =cached_item 
-                try :
-                    self .send_response (200 )
-                    for k ,v in cached_headers .items ():
-                        self .send_header (k ,v )
-                    self .send_header ('X-Cache','HIT-RAM')
-                    self .send_header ('Access-Control-Allow-Origin','*')
-                    self .send_header ('Cache-Control','public, max-age=300')
-                    self .end_headers ()
-                    if not head_only :
-                        self .wfile .write (cached_bytes )
-                    return 
-                except (BrokenPipeError ,ConnectionResetError ):
-                    return 
-            try :
-                playback_headers =resolver .playback_headers_for_ts_url (real_url )if resolver else {}
-            except YsptpError as err :
-                self ._send (500 ,f'{err }\n',head_only =head_only )
-                return 
-            try :
-                extra = {"Range": header_value_clean(range_header)} if range_header else {}
-                headers = _playback_request_headers(playback_headers, extra)
-                with open_media(real_url, headers, method="HEAD" if head_only else "GET", timeout=30) as resp:
-                    resp_headers_to_pass ={}
-                    for k, v in resp.headers.items():
-                        kl =k .lower ()
-                        if kl in ('content-type','content-range','accept-ranges','content-length','location'):
-                            resp_headers_to_pass [k ]=v 
-                    self .send_response (resp .status )
-                    for k ,v in resp_headers_to_pass .items ():
-                        self .send_header (k ,v )
-                    self .send_header ('X-Cache','MISS-UPSTREAM')
-                    self .send_header ('Access-Control-Allow-Origin','*')
-                    self .send_header ('Cache-Control','public, max-age=300')
-                    self .end_headers ()
-                    if not head_only :
-                        body_buffer =bytearray ()
-                        is_oversized =False 
-                        expected_len =None 
-                        cl_val =resp_headers_to_pass .get ('Content-Length')or resp_headers_to_pass .get ('content-length')
-                        if cl_val :
-                            try :
-                                expected_len =int (cl_val )
-                                if expected_len >35 *1024 *1024 :
-                                    is_oversized =True 
-                            except ValueError :
-                                pass 
-                        while True :
-                            chunk =resp .read (262144 )
-                            if not chunk :
-                                break 
-                            self .wfile .write (chunk )
-                            if resp .status ==200 and not is_oversized :
-                                if len (body_buffer )+len (chunk )<=35 *1024 *1024 :
-                                    body_buffer .extend (chunk )
-                                else :
-                                    is_oversized =True 
-                                    body_buffer .clear ()
-                        if resp .status ==200 and not is_oversized and body_buffer :
-                            if expected_len is None or len (body_buffer )==expected_len :
-                                global_ts_cache .set (real_url ,bytes (body_buffer ),resp_headers_to_pass )
-            except (BrokenPipeError ,ConnectionResetError ):
-                pass 
-            except Exception as e :
-                try :
-                    self .send_error (502 ,f'Upstream CDN error: {e }')
-                except Exception :
-                    pass 
-            return 
+            self.serve_device_segment(real_url, token, head_only)
+            return
         if path == '/replay-segment.ts':
             params = urllib.parse.parse_qs(parts.query)
             target = params.get('url', [''])[0]
@@ -3522,7 +3673,7 @@ def main ():
     global resolver ,server_port ,engine_port ,global_channel_dir ,global_ts_cache 
     if os.name == 'nt':
         os.system('') 
-    ap =argparse .ArgumentParser (description ='央视频全频道直播代理（ysp-live v11.2）')
+    ap =argparse .ArgumentParser (description ='央视频全频道直播代理（ysp-live v11.3）')
     ap .add_argument ('port',nargs ='?',type =int ,default =8767 ,help ='监听端口 (默认 8767)')
     ap .add_argument ('--bind',default ='0.0.0.0',help ='监听地址 (默认 0.0.0.0)')
     ap .add_argument ('--data-dir',default =os .environ .get ('YSP_DATA_DIR',''),help ='数据持久化目录 (默认由 YSP_DATA_DIR 环境变量或脚本所在目录决定)')
@@ -3594,7 +3745,7 @@ def main ():
     RESET = '\033[0m'
 
     log ('====================================================================')
-    log (f'ysp-live v11.2 启动成功: {channels_count } 个独立频道 (央视 {c_yangshi } 路, 卫视 {c_weishi } 路)')
+    log (f'ysp-live v11.3 启动成功: {channels_count } 个独立频道 (央视 {c_yangshi } 路, 卫视 {c_weishi } 路)')
     log (f'全频道订阅:   http://localhost:{args .port }/all.m3u')
     log (f'系统健康度:   http://localhost:{args .port }/health')
     log (f'实时诊断日志: http://localhost:{args .port }/diag')

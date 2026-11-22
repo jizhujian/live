@@ -1,4 +1,4 @@
-"""Decode one video frame per channel from a running 11.2 subscription."""
+"""Decode one video frame per channel from a running 11.3 subscription."""
 import argparse
 import concurrent.futures
 import json
@@ -47,8 +47,8 @@ def main():
     base = args.base_url.rstrip("/")
     op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with op.open(base+"/health", timeout=8) as response:
-        if json.load(response).get("version") != "11.2":
-            ap.error("测试端口运行的不是 11.2")
+        if json.load(response).get("version") != "11.3":
+            ap.error("测试端口运行的不是 11.3")
     with op.open(base+"/all.m3u", timeout=8) as response:
         urls = [line.strip() for line in response.read().decode().splitlines()
                 if line.startswith(base+"/") and line.endswith(".m3u8")]

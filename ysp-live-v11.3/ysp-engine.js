@@ -3,7 +3,7 @@ const https = require('https');
 const crypto = require('crypto');
 const url = require('url');
 
-const VERSION = '11.2';
+const VERSION = '11.3';
 const GATEWAY_PORT = Number(process.env.YSP_GATEWAY_PORT || 0);
 const CATCHUP_CHANNELS = new Set((process.env.YSP_CATCHUP_CHANNELS || '').split(',').filter(Boolean));
 const TIME_WINDOW_PARAMS = new Set(['playseek', 'start', 'end', 'utc', 'lutc', 'starttime', 'endtime', 'catchup', 'timeshift']);
