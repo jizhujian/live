@@ -1,4 +1,5 @@
 # 央视 / 央视频直连规则集 (适用于 Surge / Loon / Shadowrocket Rule-Set)
+# 版本 20261124
 # 官方发布社区: https://t.me/garysclub
 
 DOMAIN-SUFFIX,cctv.cn
@@ -28,6 +29,9 @@ DOMAIN-KEYWORD,livehw
 DOMAIN-KEYWORD,livebd
 DOMAIN-KEYWORD,livews
 DOMAIN-KEYWORD,kunlun
+DOMAIN,garysclub.sharewithyou.dpdns.org
+DOMAIN,epg.zsdc.eu.org
+DOMAIN,epg.pw
 DOMAIN,localhost
 DOMAIN-SUFFIX,localhost
 DOMAIN-SUFFIX,local

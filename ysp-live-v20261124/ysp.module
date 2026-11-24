@@ -1,8 +1,9 @@
 #!name=央视频直连分流
-#!desc=将匹配的央视频直播、回看及本地网关连接设为直连
+#!desc=央视频直播、回看、台标、节目单及本地网关直连
 #!author=Gary's Club
 #!homepage=https://t.me/garysclub
-#!date=2026-11-19
+#!version=20261124
+#!date=2026-11-24
 
 [Rule]
 DOMAIN-SUFFIX,cctv.cn,DIRECT
@@ -32,6 +33,9 @@ DOMAIN-KEYWORD,livehw,DIRECT
 DOMAIN-KEYWORD,livebd,DIRECT
 DOMAIN-KEYWORD,livews,DIRECT
 DOMAIN-KEYWORD,kunlun,DIRECT
+DOMAIN,garysclub.sharewithyou.dpdns.org,DIRECT
+DOMAIN,epg.zsdc.eu.org,DIRECT
+DOMAIN,epg.pw,DIRECT
 DOMAIN,localhost,DIRECT
 DOMAIN-SUFFIX,localhost,DIRECT
 DOMAIN-SUFFIX,local,DIRECT

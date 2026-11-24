@@ -1,10 +1,10 @@
 services:
   ysp-live:
-    image: ysp-live:11.3
+    image: ysp-live:20261124
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: ysp-live-v11.3
+    container_name: ysp-live-v20261124
     restart: unless-stopped
     ports:
       - "8767:8767"
